@@ -126,6 +126,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/config/reload", post(api::post_config_reload))
         // System stats
         .route("/api/system", get(api::get_system_stats))
+        // GPU Telemetry history
+        .route("/api/telemetry/{pci_address}", get(api::get_telemetry))
         // Setup generator (Windows Remote-Node)
         .route("/api/setup/generate", post(api::post_setup_generate))
         .route("/api/setup/instructions", get(api::get_setup_instructions))

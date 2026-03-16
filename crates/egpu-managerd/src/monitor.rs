@@ -186,6 +186,7 @@ impl MonitorOrchestrator {
         let gpu_cancel = self.cancel.clone();
         let gpu_sse = self.sse.clone();
         let gpu_trigger_tx = trigger_tx.clone();
+        let gpu_db = self.db.clone();
         tokio::spawn(async move {
             Self::gpu_polling_loop(
                 gpu_state,
@@ -193,6 +194,7 @@ impl MonitorOrchestrator {
                 gpu_cancel,
                 gpu_sse,
                 gpu_trigger_tx,
+                gpu_db,
             )
             .await;
         });
@@ -417,9 +419,11 @@ impl MonitorOrchestrator {
         cancel: CancellationToken,
         sse: Option<SseBroadcaster>,
         trigger_tx: mpsc::Sender<WarningTrigger>,
+        db: EventDb,
     ) {
         let gpu_monitor = NvidiaSmiMonitor::new(config.gpu.nvidia_smi_timeout_seconds);
         let mut consecutive_timeouts: u32 = 0;
+        let mut last_telemetry_log = std::time::Instant::now();
 
         // Idle model tracking
         let mut last_gpu_activity: Option<std::time::Instant> = None;
@@ -655,6 +659,39 @@ impl MonitorOrchestrator {
                                     st.scheduler.set_compute_utilization(target, gpu.utilization_gpu_percent);
                                 }
                                 st.gpu_status = gpus.clone();
+                            }
+
+                            // Telemetry logging (every 30s to avoid DB bloat)
+                            if last_telemetry_log.elapsed() >= std::time::Duration::from_secs(30) {
+                                let st = state.lock().await;
+                                let hs = st.health_score.current_score();
+                                let wl = format!("{}", st.warning_machine.current_level());
+                                drop(st);
+
+                                for gpu in &gpus {
+                                    let gpu_type = if gpu.pci_address == config.gpu.egpu_pci_address {
+                                        "egpu"
+                                    } else {
+                                        "internal"
+                                    };
+                                    if let Err(e) = db.log_gpu_telemetry(
+                                        &gpu.pci_address,
+                                        gpu_type,
+                                        gpu.temperature_c,
+                                        gpu.utilization_gpu_percent,
+                                        gpu.memory_used_mb,
+                                        gpu.memory_total_mb,
+                                        gpu.power_draw_w,
+                                        &gpu.pstate,
+                                        gpu.fan_speed_percent,
+                                        gpu.clock_graphics_mhz,
+                                        Some(hs),
+                                        Some(&wl),
+                                    ).await {
+                                        debug!("Telemetrie-Logging fehlgeschlagen: {e}");
+                                    }
+                                }
+                                last_telemetry_log = std::time::Instant::now();
                             }
 
                             // Health score tick + SSE broadcast
@@ -1058,6 +1095,12 @@ impl MonitorOrchestrator {
                     }
                     if let Err(e) = db.aggregate_monitoring_events(aggregate_days).await {
                         error!("Aggregation fehlgeschlagen: {e}");
+                    }
+                    // Telemetrie-Daten aufräumen (gleiche Retention wie Events)
+                    match db.clean_telemetry(retention_days).await {
+                        Ok(n) if n > 0 => info!("Telemetrie: {n} alte Einträge gelöscht"),
+                        Err(e) => error!("Telemetrie-Cleanup fehlgeschlagen: {e}"),
+                        _ => {}
                     }
 
                     // FIX 19: Datenbankgroesse pruefen

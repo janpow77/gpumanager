@@ -174,6 +174,25 @@ impl EventDb {
             );
             CREATE INDEX IF NOT EXISTS idx_agg_bucket ON monitoring_aggregates(bucket_start);
 
+            CREATE TABLE IF NOT EXISTS gpu_telemetry (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp         TEXT NOT NULL,
+                pci_address       TEXT NOT NULL,
+                gpu_type          TEXT NOT NULL,
+                temperature_c     INTEGER NOT NULL,
+                utilization_pct   INTEGER NOT NULL,
+                memory_used_mb    INTEGER NOT NULL,
+                memory_total_mb   INTEGER NOT NULL,
+                power_draw_w      REAL NOT NULL,
+                pstate            TEXT NOT NULL,
+                fan_speed_pct     INTEGER NOT NULL DEFAULT 0,
+                clock_graphics_mhz INTEGER NOT NULL DEFAULT 0,
+                health_score      REAL,
+                warning_level     TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_telemetry_ts ON gpu_telemetry(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_telemetry_pci ON gpu_telemetry(pci_address);
+
             CREATE TABLE IF NOT EXISTS llm_usage (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 app_id        TEXT NOT NULL,
@@ -513,6 +532,97 @@ impl EventDb {
                 .ok()
                 .map(|m| m.len() / (1024 * 1024))
         })
+    }
+
+    /// GPU-Telemetrie in die Datenbank loggen (einmal pro Intervall).
+    pub async fn log_gpu_telemetry(
+        &self,
+        pci_address: &str,
+        gpu_type: &str,
+        temperature_c: u32,
+        utilization_pct: u32,
+        memory_used_mb: u64,
+        memory_total_mb: u64,
+        power_draw_w: f64,
+        pstate: &str,
+        fan_speed_pct: u32,
+        clock_graphics_mhz: u32,
+        health_score: Option<f64>,
+        warning_level: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO gpu_telemetry (timestamp, pci_address, gpu_type, temperature_c,
+             utilization_pct, memory_used_mb, memory_total_mb, power_draw_w, pstate,
+             fan_speed_pct, clock_graphics_mhz, health_score, warning_level)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                now,
+                pci_address,
+                gpu_type,
+                temperature_c,
+                utilization_pct,
+                memory_used_mb as i64,
+                memory_total_mb as i64,
+                power_draw_w,
+                pstate,
+                fan_speed_pct,
+                clock_graphics_mhz,
+                health_score,
+                warning_level,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// GPU-Telemetrie der letzten N Stunden abfragen (fuer Auswertung).
+    pub async fn query_telemetry(
+        &self,
+        pci_address: &str,
+        hours: u32,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().await;
+        let since = (Utc::now() - chrono::Duration::hours(i64::from(hours))).to_rfc3339();
+        let mut stmt = conn.prepare(
+            "SELECT timestamp, temperature_c, utilization_pct, memory_used_mb,
+                    power_draw_w, pstate, fan_speed_pct, clock_graphics_mhz,
+                    health_score, warning_level
+             FROM gpu_telemetry
+             WHERE pci_address = ?1 AND timestamp >= ?2
+             ORDER BY timestamp ASC",
+        )?;
+
+        let rows = stmt
+            .query_map(params![pci_address, since], |row| {
+                Ok(serde_json::json!({
+                    "timestamp": row.get::<_, String>(0)?,
+                    "temperature_c": row.get::<_, i32>(1)?,
+                    "utilization_pct": row.get::<_, i32>(2)?,
+                    "memory_used_mb": row.get::<_, i64>(3)?,
+                    "power_draw_w": row.get::<_, f64>(4)?,
+                    "pstate": row.get::<_, String>(5)?,
+                    "fan_speed_pct": row.get::<_, i32>(6)?,
+                    "clock_graphics_mhz": row.get::<_, i32>(7)?,
+                    "health_score": row.get::<_, Option<f64>>(8)?,
+                    "warning_level": row.get::<_, Option<String>>(9)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// Alte Telemetrie-Daten aufräumen (älter als retention_days).
+    pub async fn clean_telemetry(&self, retention_days: u32) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().await;
+        let cutoff = (Utc::now() - chrono::Duration::days(i64::from(retention_days))).to_rfc3339();
+        let deleted = conn.execute(
+            "DELETE FROM gpu_telemetry WHERE timestamp < ?1",
+            params![cutoff],
+        )?;
+        Ok(deleted)
     }
 
     /// VACUUM ausfuehren um Speicherplatz nach Loeschungen freizugeben.

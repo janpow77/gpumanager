@@ -1524,3 +1524,34 @@ pub fn check_bearer_auth(
         _ => Err(api_error(StatusCode::UNAUTHORIZED, "Bearer-Token erforderlich")),
     }
 }
+
+// ─── GET /api/telemetry/:pci_address ──────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct TelemetryQuery {
+    pub hours: Option<u32>,
+}
+
+/// GET /api/telemetry/:pci_address — GPU-Telemetrie der letzten N Stunden
+pub async fn get_telemetry(
+    State(state): State<Arc<AppState>>,
+    Path(pci_address): Path<String>,
+    Query(query): Query<TelemetryQuery>,
+) -> impl IntoResponse {
+    let hours = query.hours.unwrap_or(24).min(168); // max 7 Tage
+
+    match state.db.query_telemetry(&pci_address, hours).await {
+        Ok(data) => Json(serde_json::json!({
+            "pci_address": pci_address,
+            "hours": hours,
+            "count": data.len(),
+            "data": data,
+        }))
+        .into_response(),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Telemetrie nicht lesbar: {e}"),
+        )
+        .into_response(),
+    }
+}
