@@ -128,6 +128,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/system", get(api::get_system_stats))
         // GPU Telemetry history
         .route("/api/telemetry/{pci_address}", get(api::get_telemetry))
+        // API Discovery (fuer externe App-Anbindung)
+        .route("/api/v1/discover", get(api::get_discover))
         // Setup generator (Windows Remote-Node)
         .route("/api/setup/generate", post(api::post_setup_generate))
         .route("/api/setup/instructions", get(api::get_setup_instructions))

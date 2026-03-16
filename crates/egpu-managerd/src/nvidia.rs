@@ -157,9 +157,13 @@ fn parse_gpu_status_output(output: &str) -> Result<Vec<GpuStatus>, GpuError> {
         // gpu_operation_mode als Throttle-Reason (z.B. "All On", "Compute", "[N/A]")
         let throttle_reason = parts[14].trim().to_string();
 
+        // GPU UUID aus /proc/driver/nvidia/gpus/{pci}/information lesen
+        let gpu_uuid = read_gpu_uuid(&pci_address).unwrap_or_default();
+
         gpus.push(GpuStatus {
             pci_address,
             nvidia_index,
+            gpu_uuid,
             name,
             gpu_type: GpuType::Internal, // Wird vom Caller anhand der Config gesetzt
             temperature_c,
@@ -185,6 +189,22 @@ fn parse_gpu_status_output(output: &str) -> Result<Vec<GpuStatus>, GpuError> {
 
     debug!("{} GPU(s) von nvidia-smi geparst", gpus.len());
     Ok(gpus)
+}
+
+/// Read GPU UUID from /proc/driver/nvidia/gpus/{pci_address}/information.
+/// Returns the UUID string like "GPU-bd7dd984-fd6a-3d83-a22c-539b5b438290".
+fn read_gpu_uuid(pci_address: &str) -> Option<String> {
+    let path = format!("/proc/driver/nvidia/gpus/{pci_address}/information");
+    let content = std::fs::read_to_string(&path).ok()?;
+    for line in content.lines() {
+        if let Some(uuid) = line.strip_prefix("GPU UUID:") {
+            let uuid = uuid.trim();
+            if !uuid.is_empty() {
+                return Some(uuid.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn parse_dmon_output(output: &str, pci_address: &str) -> Result<PcieThroughput, GpuError> {

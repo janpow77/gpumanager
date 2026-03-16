@@ -150,6 +150,7 @@ pub struct HealthScoreInfo {
 pub struct GpuInfo {
     pub pci_address: String,
     pub nvidia_index: Option<u32>,
+    pub gpu_uuid: String,
     pub name: String,
     #[serde(rename = "type")]
     pub gpu_type: String,
@@ -235,6 +236,7 @@ pub async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
             GpuInfo {
                 pci_address: g.pci_address.clone(),
                 nvidia_index: g.nvidia_index,
+                gpu_uuid: g.gpu_uuid.clone(),
                 name: g.name.clone(),
                 gpu_type: gpu_type.to_string(),
                 temperature_c: g.temperature_c,
@@ -1554,4 +1556,111 @@ pub async fn get_telemetry(
         )
         .into_response(),
     }
+}
+
+// ─── GET /api/v1/discover — API-Discovery fuer externe Apps ────────────────
+
+/// Discovery-Endpoint: Beschreibt alle verfuegbaren API-Endpunkte,
+/// Authentifizierung, GPU-UUIDs und LLM-Gateway-Integration.
+/// Andere Anwendungen koennen diesen Endpoint nutzen, um sich automatisch
+/// an den eGPU Manager anzubinden.
+pub async fn get_discover(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = state.config.load();
+    let monitor_state = state.monitor_state.lock().await;
+
+    let gpus: Vec<serde_json::Value> = monitor_state
+        .gpu_status
+        .iter()
+        .map(|g| {
+            let gpu_type = if g.pci_address == cfg.gpu.egpu_pci_address {
+                "egpu"
+            } else {
+                "internal"
+            };
+            serde_json::json!({
+                "pci_address": g.pci_address,
+                "gpu_uuid": g.gpu_uuid,
+                "name": g.name,
+                "type": gpu_type,
+                "memory_total_mb": g.memory_total_mb,
+                "nvidia_index": g.nvidia_index,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "service": "egpu-manager",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "eGPU Manager — GPU Monitoring, Scheduling, LLM Gateway",
+        "base_url": format!("http://localhost:{}", cfg.local_api.port),
+        "auth": {
+            "type": if cfg.local_api.api_token.is_empty() { "none" } else { "bearer" },
+            "header": "Authorization",
+            "note": "Bearer-Token nur fuer destruktive Endpunkte (POST). GET ist frei."
+        },
+        "gpus": gpus,
+        "egpu_pci_address": cfg.gpu.egpu_pci_address,
+        "internal_pci_address": cfg.gpu.internal_pci_address,
+        "endpoints": {
+            "status": {
+                "method": "GET",
+                "path": "/api/status",
+                "description": "GPU-Status, Health Score, Warning Level, Pipelines"
+            },
+            "gpu_acquire": {
+                "method": "POST",
+                "path": "/api/gpu/acquire",
+                "description": "GPU-Lease anfordern (VRAM reservieren)",
+                "body": {"pipeline": "string", "workload_type": "string", "vram_mb": 4000, "duration_seconds": 3600},
+                "returns": {"granted": true, "gpu_device": "PCI", "gpu_uuid": "GPU-xxx", "lease_id": "uuid"}
+            },
+            "gpu_release": {
+                "method": "POST",
+                "path": "/api/gpu/release",
+                "body": {"lease_id": "uuid"}
+            },
+            "gpu_recommend": {
+                "method": "GET",
+                "path": "/api/gpu/recommend",
+                "description": "Empfohlene GPU basierend auf Last und Warning Level"
+            },
+            "llm_chat": {
+                "method": "POST",
+                "path": "/api/llm/chat/completions",
+                "description": "OpenAI-kompatible Chat Completion via LLM Gateway",
+                "headers": {"X-App-Id": "app_name"},
+                "body": {"model": "string", "messages": [{"role": "user", "content": "string"}]},
+                "compatible_with": "OpenAI Chat Completions API"
+            },
+            "llm_providers": {
+                "method": "GET",
+                "path": "/api/llm/providers",
+                "description": "Verfuegbare LLM-Provider und deren Status"
+            },
+            "llm_health": {
+                "method": "GET",
+                "path": "/api/llm/health",
+                "description": "Health-Check des LLM Gateways"
+            },
+            "telemetry": {
+                "method": "GET",
+                "path": "/api/telemetry/{pci_address}?hours=24",
+                "description": "GPU-Telemetrie-Historie (Temp, VRAM, Power, Health Score)"
+            },
+            "events_stream": {
+                "method": "GET",
+                "path": "/api/events/stream",
+                "description": "Server-Sent Events (SSE) fuer Echtzeit-Updates",
+                "event_types": ["gpu_status", "warning_level", "health_score", "recovery_stage", "pipeline_change"]
+            }
+        },
+        "integration": {
+            "python_client": "pip install egpu-llm-client (oder clients/python/egpu_llm_client.py kopieren)",
+            "docker_access": "http://host.docker.internal:{port} (Linux: --add-host=host.docker.internal:host-gateway)",
+            "env_vars": {
+                "EGPU_MANAGER_URL": format!("http://localhost:{}", cfg.local_api.port),
+                "NVIDIA_VISIBLE_DEVICES": "GPU-UUID aus /api/gpu/acquire oder /api/v1/discover"
+            }
+        }
+    }))
 }

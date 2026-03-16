@@ -1285,11 +1285,19 @@ pub async fn acquire_gpu_lease(
                 GpuTarget::Internal => config.gpu.internal_pci_address.clone(),
             };
 
+            // Echte GPU UUID aus MonitorState.gpu_status holen
+            let gpu_uuid = st
+                .gpu_status
+                .iter()
+                .find(|g| g.pci_address == gpu_device)
+                .map(|g| g.gpu_uuid.clone())
+                .unwrap_or_default();
+
             let lease = GpuLease {
                 lease_id: lease_id.clone(),
                 pipeline,
                 gpu_device,
-                gpu_uuid: lease_id.clone(),
+                gpu_uuid,
                 vram_mb,
                 workload_type,
                 acquired_at: now,

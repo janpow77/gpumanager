@@ -15,6 +15,7 @@ pub enum GpuType {
 pub struct GpuStatus {
     pub pci_address: String,
     pub nvidia_index: Option<u32>,
+    pub gpu_uuid: String,
     pub name: String,
     pub gpu_type: GpuType,
     pub temperature_c: u32,
