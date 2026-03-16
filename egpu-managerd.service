@@ -27,7 +27,7 @@ Environment=RUST_LOG=info
 
 # Security hardening
 ProtectSystem=strict
-ReadWritePaths=/tmp/egpu-manager-test /var/lib/egpu-manager /etc/egpu-manager
+ReadWritePaths=/var/lib/egpu-manager /etc/egpu-manager
 ProtectHome=read-only
 PrivateTmp=false
 NoNewPrivileges=yes
