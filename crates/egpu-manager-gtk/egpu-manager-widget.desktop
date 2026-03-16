@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=eGPU Manager Widget
+Comment=eGPU Manager Systemtray-Widget mit GPU-Status und Pipeline-Uebersicht
+Exec=/opt/egpu/egpu-manager-widget
+Icon=video-display
+Terminal=false
+Type=Application
+Categories=System;Monitor;
+Keywords=GPU;eGPU;NVIDIA;Thunderbolt;Pipeline;
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,164 @@
+schema_version = 1
+
+[system]
+log_level = "info"
+
+[database]
+db_path = "/tmp/egpu-manager-test/events.db"
+
+[gpu]
+egpu_pci_address = "0000:05:00.0"
+internal_pci_address = "0000:02:00.0"
+poll_interval_seconds = 5
+fast_poll_interval_seconds = 1
+aer_warning_threshold = 3
+aer_burst_threshold = 10
+aer_window_seconds = 60
+bandwidth_warning_percent = 70
+bandwidth_hard_limit_percent = 85
+compute_warning_percent = 90
+compute_soft_limit_percent = 70
+nvidia_smi_timeout_seconds = 5
+nvidia_smi_retry_interval_seconds = 15
+nvidia_smi_max_consecutive_timeouts = 3
+warning_cooldown_seconds = 120
+display_vram_reserve_mb = 512
+link_health_check_interval_ms = 500
+link_degradation_action = "throttle"
+cuda_watchdog_enabled = false
+cuda_watchdog_interval_ms = 500
+cuda_watchdog_timeout_ms = 2000
+
+# Health Score
+health_score_aer_penalty = 3.0
+health_score_pcie_error_penalty = 5.0
+health_score_smi_slow_penalty = 2.0
+health_score_thermal_penalty = 5.0
+health_score_recovery_per_minute = 1.0
+health_score_warning_threshold = 60.0
+health_score_critical_threshold = 40.0
+
+# Thermal Proaktiv
+thermal_throttle_temp_c = 85
+thermal_critical_temp_c = 90
+thermal_gradient_warning_c_per_min = 5.0
+
+# P-State Proaktiv
+pstate_throttle_threshold = 4
+pstate_throttle_sustained_seconds = 30
+
+# nvidia-smi Latenz
+nvidia_smi_slow_threshold_ms = 2000
+nvidia_smi_response_avg_window = 10
+
+# Adaptive Polling + Druckreduktion
+emergency_poll_interval_ms = 500
+pressure_reduction_wait_seconds = 10
+
+[thunderbolt]
+device_uuid = "8ab48780-00c3-eba8-ffff-ffffffffffff"
+device_path = "0-3"
+
+[docker]
+socket = "/var/run/docker.sock"
+
+# Lokaler Listener: 127.0.0.1:7842 fest im Quellcode
+[local_api]
+cors_origins = ["http://localhost:3002"]
+
+[ollama]
+enabled = true
+host = "http://localhost:11434"
+poll_interval_seconds = 5
+gpu_device = "0000:05:00.0"
+fallback_device = "0000:02:00.0"
+fallback_method = "helper-service"
+priority = 1
+max_vram_mb = 14000
+auto_unload_idle_minutes = 10
+
+[ollama.model_tiers]
+egpu_available = "qwen3:14b"
+internal_only = "qwen3:8b"
+cpu_only = "qwen3:1.7b"
+
+[notifications]
+log_path = "/tmp/egpu-manager-test/events.log"
+
+[recovery]
+max_attempts = 4
+reset_cooldown_seconds = 30
+
+[daemon]
+shutdown_timeout_seconds = 15
+
+# --- Pipelines ---
+
+[[pipeline]]
+project = "audit_designer"
+container = "audit_designer_celery_worker"
+compose_file = "/home/janpow/Projekte/audit_designer/docker-compose.yml"
+compose_service = "celery-worker"
+workload_types = ["ocr", "embeddings"]
+gpu_priority = 1
+gpu_device = "0000:05:00.0"
+cuda_fallback_device = "0000:02:00.0"
+vram_estimate_mb = 7168
+restart_on_fallback = true
+redis_containers = ["audit_designer_redis"]
+remote_capable = ["embeddings"]
+cuda_only = ["ocr"]
+quiesce_hooks = [
+  { container = "audit_designer_redis", command = "redis-cli BGSAVE", timeout_seconds = 5 },
+  { container = "audit_designer_db", command = "psql -U postgres -c 'CHECKPOINT'", timeout_seconds = 5 },
+]
+
+[[pipeline]]
+project = "audit_designer"
+container = "audit_designer_jupyter"
+compose_file = "/home/janpow/Projekte/audit_designer/docker-compose.yml"
+compose_service = "jupyter"
+workload_types = ["interactive", "development"]
+gpu_priority = 2
+gpu_device = "0000:05:00.0"
+cuda_fallback_device = "0000:02:00.0"
+vram_estimate_mb = 4096
+restart_on_fallback = false
+remote_capable = []
+cuda_only = ["interactive", "development"]
+
+[[pipeline]]
+project = "flowinvoice"
+container = "flowinvoice_worker"
+compose_file = "/home/janpow/Projekte/flowinvoice/docker/docker-compose.yml"
+compose_service = "worker"
+workload_types = ["ocr", "llm"]
+gpu_priority = 4
+gpu_device = "0000:05:00.0"
+cuda_fallback_device = "0000:02:00.0"
+vram_estimate_mb = 5632
+restart_on_fallback = true
+redis_containers = ["flowinvoice_redis"]
+remote_capable = ["llm"]
+cuda_only = ["ocr"]
+quiesce_hooks = [
+  { container = "flowinvoice_redis", command = "redis-cli BGSAVE", timeout_seconds = 5 },
+]
+
+# --- Remote GPU (LanGPU) ---
+
+[remote]
+enabled = true
+bind = "0.0.0.0"
+port = 7843
+token_path = "/etc/egpu-manager/remote-token.secret"
+
+[[remote_gpu]]
+name = "remote-desktop"
+host = "100.64.1.5"
+port_ollama = 11434
+port_egpu_agent = 8899
+gpu_name = "NVIDIA GeForce RTX 5060 Ti"
+vram_mb = 16384
+availability = "on-demand"
+auto_assign = false

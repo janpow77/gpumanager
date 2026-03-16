@@ -1,0 +1,41 @@
+[Unit]
+Description=eGPU Manager Daemon (Rust)
+Documentation=file:///home/janpow/Projekte/egpu/egpu-manager-spezifikation.md
+After=network.target nvidia-persistenced.service egpu-stabilize.service
+Wants=egpu-stabilize.service
+ConditionPathExists=/sys/bus/pci/devices/0000:05:00.0
+
+[Service]
+Type=simple
+ExecStart=/opt/egpu/egpu-managerd --config /etc/egpu-manager/config.toml
+Restart=on-failure
+RestartSec=10
+# WatchdogSec deaktiviert — Daemon sendet keinen sd_notify WATCHDOG=1
+# WatchdogSec=300
+
+# Graceful shutdown
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=egpu-managerd
+
+# Environment
+Environment=RUST_LOG=info
+
+# Security hardening
+ProtectSystem=strict
+ReadWritePaths=/tmp/egpu-manager-test /home/janpow/Projekte
+ProtectHome=true
+PrivateTmp=false
+NoNewPrivileges=no
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN
+AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_ADMIN
+
+# Docker socket access
+SupplementaryGroups=docker
+
+[Install]
+WantedBy=multi-user.target

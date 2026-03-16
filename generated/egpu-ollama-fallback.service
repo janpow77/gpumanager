@@ -1,0 +1,24 @@
+# /etc/systemd/system/egpu-ollama-fallback.service
+# Wird vom egpu-manager-Daemon ausgelöst um Ollama auf eine andere GPU zu verschieben.
+# Der Daemon selbst hat keine Berechtigung für systemctl restart oder /etc/default/ollama.
+#
+# Installation:
+#   sudo cp egpu-ollama-fallback.service /etc/systemd/system/
+#   sudo cp ollama-fallback.sh /usr/lib/egpu-manager/
+#   sudo chmod +x /usr/lib/egpu-manager/ollama-fallback.sh
+#   sudo systemctl daemon-reload
+#
+# Der Daemon löst diesen Service aus über:
+#   sudo systemctl start egpu-ollama-fallback.service
+#
+# Sudoers-Eintrag (optional, damit der Daemon ohne Passwort auslösen kann):
+#   egpu-manager ALL=(root) NOPASSWD: /usr/bin/systemctl start egpu-ollama-fallback.service
+
+[Unit]
+Description=eGPU Ollama GPU Fallback Switch
+After=ollama.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/egpu-manager/ollama-fallback.sh
+RemainAfterExit=no

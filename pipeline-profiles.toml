@@ -1,0 +1,290 @@
+# pipeline-profiles.toml — Ergebnis der Phase-0-Analyse
+# Generiert am: 2026-03-14
+# Analysierte Projekte: audit_designer, flowinvoice, Workshop
+# Nicht analysiert: hpp (Verzeichnis existiert nicht, hat keine Pipeline)
+#
+# WICHTIG: Diese Datei muss manuell geprüft und freigegeben werden
+# bevor sie in die config.toml integriert wird.
+#
+# GPU-Hardware:
+#   GPU 0 = RTX 5060 Ti (intern, 8 GB, PCI 0000:02:00.0) — DAUERBETRIEB-GPU
+#   GPU 1 = RTX 5070 Ti (eGPU, 16 GB, PCI 0000:05:00.0, UUID GPU-bd7dd984-fd6a-3d83-a22c-539b5b438290) — OPTIONAL
+#
+# ARCHITEKTUR-GRUNDSATZ:
+#   Die interne RTX 5060 Ti ist die Basis-GPU. Alles muss OHNE eGPU funktionieren.
+#   Die eGPU (RTX 5070 Ti) ist ein optionaler Leistungs-Boost — sie kann jederzeit
+#   abgezogen oder deaktiviert werden. In diesem Fall:
+#     - Alle Workloads laufen auf der internen GPU
+#     - LLM-Modelle werden auf kleinere/quantisierte Varianten downgegradet
+#     - Prioritäten bleiben gleich, nur die verfügbare Kapazität sinkt
+#     - Das ist NORMALBETRIEB, kein Degraded Mode
+#
+#   Die LanGPU (Remote RTX 5060) ist ein optionaler Zusatz der die Kapazität
+#   weiter erweitert wenn verfügbar.
+#
+# Prioritäts-Konzept:
+#   audit_designer ist der Dauerbetrieb-Workload (Prio 1–2).
+#   flowinvoice wird nur bei besonderen Terminen hochpriorisiert (Standard: Prio 4).
+#   Bei Bedarf kann flowinvoice manuell auf Prio 1 gesetzt werden —
+#   dann werden niedrigere audit_designer-Workloads auf die andere GPU geschoben.
+
+# ============================================================================
+# audit_designer — Celery Worker (GPU-Hauptverbraucher im Dauerbetrieb)
+# ============================================================================
+# Quellen: docker-compose.gpu.yml, Dockerfile.gpu (nvidia/cuda:12.8.0-runtime-ubuntu22.04),
+#          requirements.txt (torch 2.9.1, sentence-transformers 5.2.0, easyocr 1.7.2),
+#          embedding_tasks.py, text_extraction.py
+#
+# VRAM-Aufschlüsselung:
+#   - sentence-transformers (paraphrase-multilingual-mpnet-base-v2): 1.5–2.0 GB
+#   - EasyOCR (de+en Modelle): 0.8–1.2 GB
+#   - PyTorch Runtime Overhead: 0.5 GB
+#   - Batch-Buffers (Embeddings batch_size=512): 2–3 GB
+#   - Gesamt Baseline: 5–7 GB
+#
+# Hinweis: Backend-Service hat in docker-compose.gpu.yml ebenfalls GPU-Zugriff,
+# teilt sich aber die gleichen Modelle mit dem Celery-Worker. Wird nicht als
+# separate Pipeline geführt, da GPU-Nutzung im Backend minimal ist (API-Serving).
+
+[[pipeline]]
+project = "audit_designer"
+container = "audit_designer_celery_worker"
+compose_file = "/home/janpow/Projekte/audit_designer/docker-compose.yml"
+compose_service = "celery-worker"
+workload_types = ["ocr", "embeddings"]
+gpu_priority = 1
+gpu_device = "0000:05:00.0"
+cuda_fallback_device = "0000:02:00.0"
+vram_estimate_mb = 7168                    # 7 GB Worst-Case (alle Modelle geladen + Batch)
+exclusive_gpu = false
+restart_on_fallback = true
+redis_containers = ["audit_designer_redis"]
+depends_on = []
+remote_capable = ["embeddings"]            # Embeddings könnte über Remote-Ollama, OCR braucht CUDA
+cuda_only = ["ocr"]                        # EasyOCR braucht direktes CUDA
+quiesce_hooks = [
+  { container = "audit_designer_redis", command = "redis-cli BGSAVE", timeout_seconds = 5 },
+  { container = "audit_designer_db", command = "psql -U postgres -c 'CHECKPOINT'", timeout_seconds = 5 }
+]
+
+# ============================================================================
+# audit_designer — Jupyter Notebook (lokale GPU)
+# ============================================================================
+# Quellen: jupyter/Dockerfile (jupyter/scipy-notebook:python-3.11)
+#
+# Aktuell CPU-only (scipy-notebook). Soll GPU-Support bekommen für
+# interaktive Notebooks mit PyTorch/CUDA auf dem NUC.
+#
+# UMSETZUNG ERFORDERLICH:
+#   - Jupyter Dockerfile.gpu erstellen (basierend auf nvidia/cuda + jupyter)
+#   - docker-compose.gpu.yml um Jupyter-Service erweitern
+#   - torch + sentence-transformers in Jupyter-Requirements aufnehmen
+#
+# VRAM-Schätzung: 4 GB (interaktive Nutzung, variable Modellgrößen)
+# Nur lokale GPU — KEIN Remote-Routing (interaktive Latenz inakzeptabel)
+
+[[pipeline]]
+project = "audit_designer"
+container = "audit_designer_jupyter"
+compose_file = "/home/janpow/Projekte/audit_designer/docker-compose.yml"
+compose_service = "jupyter"
+workload_types = ["interactive", "development"]
+gpu_priority = 2
+gpu_device = "0000:05:00.0"
+cuda_fallback_device = "0000:02:00.0"
+vram_estimate_mb = 4096                    # 4 GB (interaktiv, variabel)
+exclusive_gpu = false
+restart_on_fallback = false                # Jupyter-Sessions nicht unterbrechen
+redis_containers = []
+depends_on = []
+remote_capable = []                        # NUR lokale GPU — kein Remote
+cuda_only = ["interactive", "development"] # Alles braucht lokales CUDA
+quiesce_hooks = []
+
+# ============================================================================
+# flowinvoice — Celery Worker (OCR + LLM, bei Bedarf hochpriorisiert)
+# ============================================================================
+# Quellen: docker/docker-compose.yml, backend/pyproject.toml,
+#          backend/app/services/chandra_ocr.py, backend/app/worker/tasks.py
+#
+# VRAM-Aufschlüsselung (aus Code-Kommentaren in tasks.py):
+#   - Chandra OCR (GPU-accelerated): ~2.0 GB
+#   - Donut Vision Model: ~0.8 GB
+#   - Ollama-Anteil (wenn in Container): ~2.7 GB (qwen2.5:1.5b)
+#   - Gesamt: ~5.5 GB (passt auf 8 GB GPU)
+#
+# WICHTIG: Embeddings laufen bei flowinvoice ABSICHTLICH auf CPU
+# (Kommentar in embeddings.py: "GPU-VRAM reserviert für Donut+Ollama,
+#  sentence-transformers auf GPU verursacht CUDA OOM bei hoher Parallelität")
+#
+# PRIORITÄT: Standard Prio 4 (Hintergrund, kein Zeitdruck).
+# Bei besonderen Terminen (Rechnungsprüfung) manuell auf Prio 1 setzen:
+#   egpu-manager priority set flowinvoice_worker 1
+# Danach zurücksetzen:
+#   egpu-manager priority set flowinvoice_worker 4
+#
+# CUDA_VISIBLE_DEVICES=0 ist in docker-compose.yml hardcoded.
+# Das muss auf die eGPU-UUID umgestellt werden!
+
+[[pipeline]]
+project = "flowinvoice"
+container = "flowinvoice_worker"
+compose_file = "/home/janpow/Projekte/flowinvoice/docker/docker-compose.yml"
+compose_service = "worker"
+workload_types = ["ocr", "llm"]
+gpu_priority = 4                           # Standard: niedrig (Hintergrund)
+gpu_device = "0000:05:00.0"               # Bei Prio 1: eGPU, bei Prio 4: Fallback wenn Prio 1/2 aktiv
+cuda_fallback_device = "0000:02:00.0"
+vram_estimate_mb = 5632                    # ~5.5 GB (Chandra + Donut + Ollama-Anteil)
+exclusive_gpu = false
+restart_on_fallback = true
+redis_containers = ["flowinvoice_redis"]
+depends_on = []
+remote_capable = ["llm"]                   # LLM-Inferenz kann über Remote-Ollama
+cuda_only = ["ocr"]                        # Chandra OCR braucht CUDA
+quiesce_hooks = [
+  { container = "flowinvoice_redis", command = "redis-cli BGSAVE", timeout_seconds = 5 }
+]
+
+# ============================================================================
+# flowinvoice — Ollama Container (optional, Profile "ollama")
+# ============================================================================
+# Ollama läuft normalerweise als Host-Service (systemd), nicht im Container.
+# Wird über den [ollama]-Block in config.toml verwaltet (Spezifikation 5.5).
+
+# ============================================================================
+# Workshop (flowworkshop_grundgeruest) — KEIN GPU-BEDARF
+# ============================================================================
+# Analyse-Ergebnis:
+#   - Dockerfile: python:3.12-slim (kein CUDA-Image)
+#   - Keine GPU-Runtime in docker-compose.yml
+#   - sentence-transformers 3.1.1 ohne explizites torch → CPU-Modus
+#   - pytesseract: CPU-only (System-Tesseract)
+#   - Ollama: Nutzt Host-Service über host.docker.internal:11434
+#   - GPU-Monitoring-Endpoint (/api/system/gpu) nur Observability
+#
+# Kein Pipeline-Eintrag.
+
+# ============================================================================
+# hpp — HAT KEINE PIPELINE
+# ============================================================================
+# Verzeichnis existiert nicht unter /home/janpow/Projekte/hpp/.
+# Hat nach Auskunft des Nutzers keine Pipeline. Aus der Analyse entfernt.
+
+# ============================================================================
+# Ollama Host-Service — Separat verwaltet
+# ============================================================================
+# Läuft als systemd-Service auf dem Host (Port 11434).
+# Hauptverbraucher von eGPU-VRAM:
+#   - qwen3:14b (Standardmodell): ~8–10 GB VRAM
+#   - qwen2.5:1.5b (flowinvoice Fallback): ~1.5 GB VRAM
+#   - llama3:8b: ~5 GB VRAM
+#
+# Konfiguration über [ollama]-Block in config.toml (Spezifikation 5.5).
+# GPU-UUID der eGPU: GPU-bd7dd984-fd6a-3d83-a22c-539b5b438290
+
+# ============================================================================
+# Remote-GPU (Windows Desktop RTX 5060) — Vorlage
+# ============================================================================
+# Flowinvoice hat bereits einen GPU-Bridge-Service:
+#   - Script: flowinvoice/scripts/gpu_bridge/bridge.py
+#   - Tailscale VPN (100.64.1.5:8899)
+#   - Standardmäßig deaktiviert
+#
+# [[remote_gpu]]
+# name = "remote-5060"
+# host = "100.64.1.5"
+# port_ollama = 11434
+# port_egpu_agent = 8899
+# gpu_name = "NVIDIA GeForce RTX 5060"
+# vram_mb = 16384
+# availability = "on-demand"
+# check_interval_seconds = 120
+# connection_timeout_seconds = 5
+# priority = 3
+# auto_assign = false
+# max_latency_ms = { llm = 50, embeddings = 100, batch = 500 }
+
+# ============================================================================
+# ZUSAMMENFASSUNG
+# ============================================================================
+#
+# Aktive GPU-Pipelines:         3
+#   1. audit_designer_celery_worker  (Prio 1, ~7 GB, OCR+Embeddings, Dauerbetrieb)
+#   2. audit_designer_jupyter        (Prio 2, ~4 GB, Interaktiv, nur lokal)
+#   3. flowinvoice_worker            (Prio 4, ~5.5 GB, OCR+LLM, bei Bedarf Prio 1)
+#
+# Ollama Host-Service:          1
+#   - Verwaltet über [ollama]-Block
+#   - VRAM: variabel (1.5–10 GB je nach Modell)
+#
+# Kein GPU-Bedarf:              2
+#   - Workshop (CPU-only)
+#   - hpp (keine Pipeline)
+#
+# ============================================================================
+# BETRIEBSMODI
+# ============================================================================
+#
+# MODUS 1 — Nur interne GPU (eGPU nicht angeschlossen = Normalbetrieb):
+#
+#   RTX 5060 Ti: ~7.800 MB verfügbar (abzgl. Display)
+#
+#   - audit_designer_celery_worker: 7.168 MB → passt knapp
+#   - audit_designer_jupyter: 4.096 MB → nur wenn Worker idle
+#   - flowinvoice_worker: 5.632 MB → nur wenn audit_designer nicht aktiv
+#   - Ollama: downgrade auf qwen3:8b (~5–6 GB) statt qwen3:14b (~10 GB)
+#     qwen3:14b passt nicht auf 8 GB, qwen3:8b schon
+#
+#   → Ein Worker + Ollama (klein) gleichzeitig auf interner GPU
+#   → Scheduler wechselt zwischen Workloads nach Priorität
+#   → Das ist NORMALBETRIEB, kein Fehlerzustand
+#
+# MODUS 2 — Interne GPU + eGPU (eGPU angeschlossen = erweitert):
+#
+#   RTX 5070 Ti: 16.303 MB verfügbar (kein Display)
+#   RTX 5060 Ti: ~7.800 MB verfügbar
+#
+#   Normalbetrieb:
+#   - eGPU: celery_worker (7 GB) + Ollama qwen3:14b (10 GB) → passt knapp
+#     ODER celery_worker (7 GB) + jupyter (4 GB) = 11 GB → passt
+#   - Interne: flowinvoice (5.5 GB) → wenn aktiv
+#
+#   flowinvoice-Termin (Prio 1):
+#   - eGPU: flowinvoice (5.5 GB) + celery_worker (7 GB) = 12.5 GB → passt
+#   - Interne: jupyter (4 GB) + Ollama klein (1.5 GB) → passt
+#
+# MODUS 3 — Alles + Remote-LanGPU (zusätzlicher Boost):
+#
+#   RTX 5060 (Remote): 16 GB, nur für LLM und Embeddings (kein CUDA)
+#
+#   - Ollama qwen3:14b kann auf Remote laufen → eGPU frei für Worker
+#   - Embeddings können remote laufen → mehr VRAM lokal
+#   - OCR bleibt immer lokal (braucht CUDA)
+#
+# ============================================================================
+# OLLAMA-MODELL-DOWNGRADE BEI ABWESENHEIT DER eGPU
+# ============================================================================
+#
+# Der [ollama]-Block in config.toml muss ein Modell-Downgrade-Mapping enthalten:
+#
+#   [ollama.model_tiers]
+#   # Wenn eGPU verfügbar: volles Modell
+#   egpu_available = "qwen3:14b"        # ~10 GB VRAM, volle Leistung
+#   # Wenn nur interne GPU: größtes qwen3 das auf 8 GB passt
+#   internal_only = "qwen3:8b"          # ~5–6 GB VRAM (Q4), lässt ~2 GB Headroom
+#   # Wenn gar keine GPU: kleinstes Modell
+#   cpu_only = "qwen3:1.7b"             # ~1.5 GB VRAM (oder CPU-Modus)
+#
+# Der Daemon wechselt das Modell automatisch über die Ollama-API
+# wenn sich die GPU-Verfügbarkeit ändert (eGPU an/ab).
+#
+# ============================================================================
+# HANDLUNGSBEDARF
+# ============================================================================
+#
+# 1. flowinvoice docker-compose.yml: CUDA_VISIBLE_DEVICES=0 durch
+#    NVIDIA_VISIBLE_DEVICES=GPU-bd7dd984-... ersetzen
+# 2. audit_designer Jupyter: Dockerfile.gpu für Jupyter erstellen,
+#    docker-compose.gpu.yml um Jupyter-Service erweitern
+# 3. Ollama model_tiers in config.toml konfigurieren

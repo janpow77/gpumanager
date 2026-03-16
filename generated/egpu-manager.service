@@ -1,0 +1,55 @@
+# /etc/systemd/system/egpu-manager.service
+# Generiert von egpu-manager — NICHT manuell bearbeiten
+# Installation: sudo cp egpu-manager.service /etc/systemd/system/
+#               sudo systemctl daemon-reload
+#               sudo systemctl enable egpu-manager
+#               sudo systemctl start egpu-manager
+
+[Unit]
+Description=eGPU Manager Daemon
+Documentation=file:///home/janpow/Projekte/egpu/egpu-manager-spezifikation.md
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/egpu-managerd --config /etc/egpu-manager/config.toml
+Restart=on-failure
+RestartSec=5
+
+# Minimale Privilegien
+User=root
+# Capabilities statt voller Root-Rechte
+AmbientCapabilities=CAP_SYS_RAWIO CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_SYS_RAWIO CAP_NET_BIND_SERVICE CAP_DAC_READ_SEARCH
+
+# Sicherheitseinschränkungen
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/egpu-manager /var/log/egpu-manager /run/egpu-manager /tmp
+ReadOnlyPaths=/sys/bus/pci /sys/bus/thunderbolt /dev/kmsg /var/run/docker.sock
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Verbotene Systemaufrufe (Abschnitt 10 + 14 der Spezifikation)
+SystemCallFilter=~@mount @reboot @swap @module
+
+# Shutdown-Timeout
+TimeoutStopSec=15
+
+# Arbeitsverzeichnis und PID
+RuntimeDirectory=egpu-manager
+StateDirectory=egpu-manager
+LogsDirectory=egpu-manager
+PIDFile=/run/egpu-manager/egpu-managerd.pid
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=egpu-managerd
+
+[Install]
+WantedBy=multi-user.target

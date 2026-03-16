@@ -1,0 +1,19 @@
+[package]
+name = "egpu-manager-common"
+version.workspace = true
+edition.workspace = true
+
+[features]
+mock-hardware = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tokio-stream = "0.1"
