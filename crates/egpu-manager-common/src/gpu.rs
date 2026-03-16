@@ -24,6 +24,10 @@ pub struct GpuStatus {
     pub memory_total_mb: u64,
     pub power_draw_w: f64,
     pub pstate: String,
+    pub fan_speed_percent: u32,
+    pub clock_graphics_mhz: u32,
+    pub clock_memory_mhz: u32,
+    pub throttle_reason: String,
     pub status: GpuOnlineStatus,
 }
 

@@ -314,14 +314,36 @@ fn default_60_u64() -> u64 {
     60
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
-pub struct LocalApiConfig {
-    #[serde(default)]
-    pub cors_origins: Vec<String>,
+fn default_bind_local() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_7842() -> u16 {
+    7842
 }
 
-// Default is derived (cors_origins defaults to empty Vec)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalApiConfig {
+    #[serde(default = "default_bind_local")]
+    pub bind_address: String,
+    #[serde(default = "default_7842")]
+    pub port: u16,
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+    /// API-Token fuer Bearer-Auth auf destruktiven Endpunkten (leer = keine Auth)
+    #[serde(default)]
+    pub api_token: String,
+}
+
+impl Default for LocalApiConfig {
+    fn default() -> Self {
+        Self {
+            bind_address: default_bind_local(),
+            port: default_7842(),
+            cors_origins: Vec::new(),
+            api_token: String::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteConfig {

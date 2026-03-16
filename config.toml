@@ -153,6 +153,10 @@ bind = "0.0.0.0"
 port = 7843
 token_path = "/etc/egpu-manager/remote-token.secret"
 
+[llm_gateway]
+enabled = true
+default_provider = "ollama"
+
 [[remote_gpu]]
 name = "remote-desktop"
 host = "100.64.1.5"

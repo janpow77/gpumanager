@@ -14,7 +14,7 @@ use egpu_manager_common::config::Config;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::db::EventDb;
 use crate::monitor::MonitorState;
@@ -27,6 +27,7 @@ pub struct AppState {
     pub monitor_state: Arc<Mutex<MonitorState>>,
     pub sse: SseBroadcaster,
     pub started_at: Instant,
+    pub llm_router: Option<Arc<crate::llm::router::LlmRouter>>,
 }
 
 /// Serve the embedded HTML UI at root.
@@ -57,7 +58,14 @@ fn build_router(state: Arc<AppState>) -> Router {
             ]);
 
         if state.config.local_api.cors_origins.is_empty() {
-            cors = cors.allow_origin(tower_http::cors::Any);
+            // Kein offener Zugriff: nur localhost als Standard erlauben
+            let default_origin: HeaderValue = format!(
+                "http://localhost:{}",
+                state.config.local_api.port
+            )
+            .parse()
+            .unwrap_or_else(|_| "http://localhost:7842".parse().unwrap());
+            cors = cors.allow_origin(vec![default_origin]);
         } else {
             let origins: Vec<HeaderValue> = state
                 .config
@@ -120,6 +128,11 @@ fn build_router(state: Arc<AppState>) -> Router {
         // Setup generator (Windows Remote-Node)
         .route("/api/setup/generate", post(api::post_setup_generate))
         .route("/api/setup/instructions", get(api::get_setup_instructions))
+        // LLM Gateway
+        .route("/api/llm/chat/completions", post(api::post_llm_chat_completions))
+        .route("/api/llm/providers", get(api::get_llm_providers))
+        .route("/api/llm/usage/{app_id}", get(api::get_llm_usage))
+        .route("/api/llm/health", get(api::get_llm_health))
         // Middleware
         .layer(cors)
         .with_state(state)
@@ -139,17 +152,38 @@ pub async fn start_web_server(
     cancel: CancellationToken,
     sse: SseBroadcaster,
 ) {
+    // LLM Gateway initialisieren falls konfiguriert
+    let llm_router = config
+        .llm_gateway
+        .as_ref()
+        .filter(|gw| gw.enabled)
+        .map(|gw| {
+            let secrets = crate::llm::router::LlmSecrets::load(
+                "/etc/egpu-manager/llm-secrets.toml",
+            );
+            Arc::new(crate::llm::router::LlmRouter::new(gw.clone(), &secrets))
+        });
+
     let state = Arc::new(AppState {
-        config,
+        config: Arc::clone(&config),
         db,
         monitor_state,
         sse,
         started_at: Instant::now(),
+        llm_router,
     });
 
     let router = build_router(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 7842));
+    let bind_addr: std::net::IpAddr = config
+        .local_api
+        .bind_address
+        .parse()
+        .unwrap_or_else(|_| {
+            warn!("Ungueltige bind_address '{}', verwende 0.0.0.0", config.local_api.bind_address);
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
+        });
+    let addr = SocketAddr::from((bind_addr, config.local_api.port));
     info!("Web-Server startet auf http://{addr}");
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -222,6 +256,7 @@ mod tests {
             monitor_state,
             sse: SseBroadcaster::new(64),
             started_at: Instant::now(),
+            llm_router: None,
         })
     }
 

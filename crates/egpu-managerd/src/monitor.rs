@@ -280,6 +280,24 @@ impl MonitorOrchestrator {
         let trigger_clone = trigger.clone();
         let mut state = self.state.lock().await;
 
+        // FIX 12: Health-Score-Events bei JEDEM Trigger aufzeichnen, nicht nur bei Eskalation
+        match &trigger_clone {
+            t if *t == WarningTrigger::AerThreshold || *t == WarningTrigger::AerBurst => {
+                state.health_score.record_event(HealthEventKind::AerError);
+            }
+            t if *t == WarningTrigger::LinkWidthDegradation
+                || *t == WarningTrigger::LinkSpeedDegradation
+                || *t == WarningTrigger::LinkDown =>
+            {
+                state.health_score.record_event(HealthEventKind::PcieTransient);
+            }
+            // FIX 11: CmpltToPattern und GpuProgressError ebenfalls als PCIe-Transient werten
+            t if *t == WarningTrigger::CmpltToPattern || *t == WarningTrigger::GpuProgressError => {
+                state.health_score.record_event(HealthEventKind::PcieTransient);
+            }
+            _ => {}
+        }
+
         if let Some(new_level) = state.warning_machine.process_trigger(trigger) {
             // Log the level change
             let severity = match new_level {
@@ -313,6 +331,16 @@ impl MonitorOrchestrator {
                 })));
             }
 
+            // FIX 6: ntfy-Benachrichtigung bei Orange oder Red
+            if new_level >= WarningLevel::Orange {
+                send_ntfy_notification(
+                    &self.config,
+                    &format!("eGPU Warnstufe: {new_level}"),
+                    &format!("Ausloeser: {trigger_str}"),
+                    if new_level >= WarningLevel::Red { "urgent" } else { "high" },
+                );
+            }
+
             // Update scheduler warning level
             state.scheduler.set_warning_level(new_level);
 
@@ -330,20 +358,6 @@ impl MonitorOrchestrator {
                     "Migration-Aktion: {} — {:?} (Prio {})",
                     action.pipeline_name, action.action, action.priority
                 );
-            }
-
-            // Record health score events from warning triggers
-            match &trigger_clone {
-                t if *t == WarningTrigger::AerThreshold || *t == WarningTrigger::AerBurst => {
-                    state.health_score.record_event(HealthEventKind::AerError);
-                }
-                t if *t == WarningTrigger::LinkWidthDegradation
-                    || *t == WarningTrigger::LinkSpeedDegradation
-                    || *t == WarningTrigger::LinkDown =>
-                {
-                    state.health_score.record_event(HealthEventKind::PcieTransient);
-                }
-                _ => {}
             }
 
             // Gap 3: Try pressure reduction before full recovery at Orange
@@ -369,6 +383,8 @@ impl MonitorOrchestrator {
                         info!("Druckreduktion erfolgreich — Recovery vermieden");
                         let mut st = state_clone.lock().await;
                         st.recovery_active = false;
+                        // FIX 10: Aktive Trigger zuruecksetzen nach erfolgreicher Druckreduktion
+                        st.warning_machine.process_trigger(WarningTrigger::AllClear);
                     } else {
                         info!("Druckreduktion nicht ausreichend — starte volle Recovery");
                         Self::run_recovery_task(
@@ -1096,4 +1112,55 @@ pub fn release_gpu_lease(
     lease_id: &str,
 ) -> bool {
     state.active_leases.remove(lease_id).is_some()
+}
+
+/// Sendet eine ntfy-Benachrichtigung (fire-and-forget).
+/// Wird nur ausgefuehrt wenn ntfy_url und ntfy_topic konfiguriert sind.
+fn send_ntfy_notification(config: &Config, title: &str, message: &str, priority: &str) {
+    let ntfy_url = &config.notifications.ntfy_url;
+    let ntfy_topic = &config.notifications.ntfy_topic;
+
+    if ntfy_url.is_empty() || ntfy_topic.is_empty() {
+        return;
+    }
+
+    let url = format!("{}/{}", ntfy_url.trim_end_matches('/'), ntfy_topic);
+    let title = title.to_string();
+    let message = message.to_string();
+    let priority = priority.to_string();
+
+    // Fire-and-forget: ntfy-Fehler sind nicht kritisch
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("ntfy HTTP-Client Fehler: {e}");
+                return;
+            }
+        };
+
+        let result = client
+            .post(&url)
+            .header("Title", title)
+            .header("Priority", priority)
+            .header("Tags", "warning,gpu")
+            .body(message)
+            .send()
+            .await;
+
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                debug!("ntfy-Benachrichtigung gesendet");
+            }
+            Ok(resp) => {
+                warn!("ntfy-Fehler: HTTP {}", resp.status());
+            }
+            Err(e) => {
+                warn!("ntfy nicht erreichbar: {e}");
+            }
+        }
+    });
 }

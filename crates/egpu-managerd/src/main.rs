@@ -5,7 +5,6 @@ mod docker;
 mod health_score;
 mod kmsg;
 mod link_health;
-#[allow(dead_code)]
 mod llm;
 mod monitor;
 mod nvidia;

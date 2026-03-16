@@ -76,6 +76,20 @@ impl AerMonitor for SysfsAerMonitor {
             read_sysfs_u64(&path).map_err(|e| AerError::ReadError(format!("{path}: {e}")))
         }
     }
+
+    async fn read_correctable_count(&self, pci_address: &str) -> Result<u64, AerError> {
+        let path = format!("/sys/bus/pci/devices/{pci_address}/aer_dev_correctable");
+        let content =
+            read_sysfs_trimmed(&path).map_err(|e| AerError::ReadError(format!("{path}: {e}")))?;
+
+        // Gleiches Multi-Line-Format wie bei nonfatal, aber TOTAL_ERR_COR
+        if content.contains('\n') || content.contains("TOTAL_ERR_COR") {
+            parse_aer_correctable(&content)
+                .map_err(|e| AerError::ReadError(format!("{path}: {e}")))
+        } else {
+            read_sysfs_u64(&path).map_err(|e| AerError::ReadError(format!("{path}: {e}")))
+        }
+    }
 }
 
 fn read_sysfs_trimmed(path: &str) -> Result<String, String> {
@@ -97,6 +111,39 @@ fn read_sysfs_u64(path: &str) -> Result<u64, String> {
     } else {
         content.parse::<u64>().map_err(|e| format!("Parse '{content}': {e}"))
     }
+}
+
+/// AER Correctable-Zähler: Multi-Line-Format parsen
+/// Format:
+/// ```text
+/// RxErr 0
+/// BadTLP 0
+/// ...
+/// TOTAL_ERR_COR 0
+/// ```
+fn parse_aer_correctable(content: &str) -> Result<u64, String> {
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with("TOTAL_ERR_COR") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                return parts[1]
+                    .parse::<u64>()
+                    .map_err(|e| format!("Parse TOTAL_ERR_COR '{line}': {e}"));
+            }
+        }
+    }
+    // Fallback: Summe aller Eintraege
+    let mut total: u64 = 0;
+    for line in content.lines() {
+        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        if parts.len() >= 2 {
+            if let Ok(val) = parts[1].parse::<u64>() {
+                total += val;
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// AER Non-Fatal-Zähler: Multi-Line-Format parsen

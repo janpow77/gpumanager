@@ -89,6 +89,17 @@ impl EventDb {
         }
 
         let conn = Connection::open(path)?;
+
+        // WAL-Modus fuer bessere Concurrent-Performance
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+
+        // Integritaetspruefung beim Start
+        let integrity: String = conn.query_row("PRAGMA integrity_check;", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            anyhow::bail!("SQLite Integritaetspruefung fehlgeschlagen: {}", integrity);
+        }
+        info!("SQLite: WAL-Modus aktiviert, Integritaet OK");
+
         Self::create_tables(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

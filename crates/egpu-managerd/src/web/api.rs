@@ -818,8 +818,12 @@ pub async fn get_gpu_recommend(State(state): State<Arc<AppState>>) -> impl IntoR
 
 pub async fn post_egpu_admission(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<AdmissionBody>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_bearer_auth(&headers, &state.config) {
+        return resp.into_response();
+    }
     let new_state = match body.action.as_str() {
         "open" => AdmissionState::Open,
         "drain" => AdmissionState::Drain,
@@ -931,9 +935,13 @@ pub async fn get_ollama_status(State(state): State<Arc<AppState>>) -> impl IntoR
 
 pub async fn post_ollama_unload(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<UnloadModelBody>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_bearer_auth(&headers, &state.config) {
+        return resp.into_response();
+    }
     let Some(ref ollama_cfg) = state.config.ollama else {
         return api_error(StatusCode::NOT_FOUND, "Ollama nicht konfiguriert").into_response();
     };
@@ -1033,9 +1041,13 @@ pub async fn get_recovery_status(State(state): State<Arc<AppState>>) -> impl Int
 
 pub async fn post_recovery_reset(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<ConfirmBody>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_bearer_auth(&headers, &state.config) {
+        return resp.into_response();
+    }
     if is_dry_run(&dry_run) {
         return Json(DryRunResponse {
             dry_run: true,
@@ -1083,9 +1095,13 @@ pub async fn post_recovery_reset(
 
 pub async fn post_thunderbolt_reconnect(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<ConfirmBody>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_bearer_auth(&headers, &state.config) {
+        return resp.into_response();
+    }
     if is_dry_run(&dry_run) {
         return Json(DryRunResponse {
             dry_run: true,
@@ -1237,8 +1253,12 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
 pub async fn post_config_reload(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(dry_run): Query<DryRunQuery>,
 ) -> impl IntoResponse {
+    if let Err(resp) = check_bearer_auth(&headers, &state.config) {
+        return resp.into_response();
+    }
     if is_dry_run(&dry_run) {
         return Json(DryRunResponse {
             dry_run: true,
@@ -1264,14 +1284,26 @@ pub async fn post_config_reload(
         serde_json::json!({"action": "reload_requested"}),
     ));
 
-    // Note: actual hot-reload of the Arc<Config> would require
-    // an ArcSwap or RwLock pattern. For now, we signal the request.
-    Json(serde_json::json!({
-        "ok": true,
-        "message": "Config-Reload angefordert",
-        "note": "Hot-Reload wird im naechsten Monitoring-Zyklus angewendet"
-    }))
-    .into_response()
+    // Konfigurations-Datei laden und validieren
+    let config_path = std::path::Path::new("/etc/egpu-manager/config.toml");
+    match egpu_manager_common::config::Config::load(config_path) {
+        Ok(_new_config) => {
+            // Validierung erfolgreich. Hot-Swap braeuchte ArcSwap, hier nur Validierung.
+            Json(serde_json::json!({
+                "ok": true,
+                "message": "Konfiguration geladen und validiert",
+                "note": "Hot-Reload wird im naechsten Monitoring-Zyklus angewendet"
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("Konfiguration ungueltig: {e}"),
+            )
+            .into_response()
+        }
+    }
 }
 
 // ─── System Stats ───────────────────────────────────────────────────────────
@@ -1351,4 +1383,126 @@ pub async fn get_setup_instructions() -> impl IntoResponse {
             "NUC erreichbar im Netzwerk"
         ]
     }))
+}
+
+// ─── LLM Gateway Endpoints ─────────────────────────────────────────────────
+
+/// POST /api/llm/chat/completions — OpenAI-kompatible Chat-Completion via LLM Gateway
+pub async fn post_llm_chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<crate::llm::types::ChatCompletionRequest>,
+) -> impl IntoResponse {
+    let Some(ref router) = state.llm_router else {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "LLM Gateway nicht konfiguriert")
+            .into_response();
+    };
+
+    let app_id = headers
+        .get("x-app-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+
+    match router.chat_completion(request, app_id).await {
+        Ok(response) => Json(serde_json::to_value(response).unwrap()).into_response(),
+        Err(err) => {
+            let status = match err.error.r#type.as_str() {
+                "rate_limit_error" => StatusCode::TOO_MANY_REQUESTS,
+                "budget_exceeded" => StatusCode::PAYMENT_REQUIRED,
+                "permission_error" => StatusCode::FORBIDDEN,
+                "routing_error" => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            (status, Json(serde_json::to_value(err).unwrap())).into_response()
+        }
+    }
+}
+
+/// GET /api/llm/providers — Liste aller konfigurierten LLM-Provider
+pub async fn get_llm_providers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(ref router) = state.llm_router else {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "LLM Gateway nicht konfiguriert")
+            .into_response();
+    };
+
+    let statuses = router.provider_status().await;
+    Json(serde_json::json!({ "providers": statuses })).into_response()
+}
+
+/// GET /api/llm/usage/:app_id — Nutzungsstatistiken fuer eine App
+pub async fn get_llm_usage(
+    State(state): State<Arc<AppState>>,
+    Path(app_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(ref router) = state.llm_router else {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "LLM Gateway nicht konfiguriert")
+            .into_response();
+    };
+
+    let summary = router.usage_for_app(&app_id).await;
+    Json(serde_json::to_value(summary).unwrap()).into_response()
+}
+
+/// GET /api/llm/health — Health-Check fuer das LLM Gateway
+pub async fn get_llm_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(ref router) = state.llm_router else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "disabled",
+                "providers_count": 0,
+                "healthy_count": 0,
+            })),
+        )
+            .into_response();
+    };
+
+    let providers = router.provider_status().await;
+    let any_healthy = providers.iter().any(|p| p.healthy);
+
+    let status = if any_healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status,
+        Json(serde_json::json!({
+            "status": if any_healthy { "ok" } else { "degraded" },
+            "providers_count": providers.len(),
+            "healthy_count": providers.iter().filter(|p| p.healthy).count(),
+        })),
+    )
+        .into_response()
+}
+
+// ─── Bearer Token Auth Middleware ────────────────────────────────────────────
+
+/// Prueft Bearer-Token-Authentifizierung fuer destruktive Endpunkte.
+/// Gibt Ok(()) zurueck wenn auth bestanden oder nicht konfiguriert (token leer).
+pub fn check_bearer_auth(
+    headers: &axum::http::HeaderMap,
+    config: &egpu_manager_common::config::Config,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let token = &config.local_api.api_token;
+    if token.is_empty() {
+        return Ok(()); // Keine Auth konfiguriert, abwaertskompatibel
+    }
+
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    match auth_header {
+        Some(value) if value.starts_with("Bearer ") => {
+            let provided = &value[7..];
+            if provided == token {
+                Ok(())
+            } else {
+                Err(api_error(StatusCode::FORBIDDEN, "Ungueltiger API-Token"))
+            }
+        }
+        _ => Err(api_error(StatusCode::UNAUTHORIZED, "Bearer-Token erforderlich")),
+    }
 }

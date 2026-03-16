@@ -20,6 +20,12 @@ pub trait GpuMonitor: Send + Sync {
 #[async_trait]
 pub trait AerMonitor: Send + Sync {
     async fn read_nonfatal_count(&self, pci_address: &str) -> Result<u64, AerError>;
+    /// Liest korrigierbare AER-Fehler (aer_dev_correctable).
+    /// Default-Implementierung gibt 0 zurueck (abwaertskompatibel).
+    async fn read_correctable_count(&self, pci_address: &str) -> Result<u64, AerError> {
+        let _ = pci_address;
+        Ok(0)
+    }
 }
 
 /// PCIe-Link-Health aus sysfs

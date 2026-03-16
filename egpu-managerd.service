@@ -30,9 +30,11 @@ ProtectSystem=strict
 ReadWritePaths=/tmp/egpu-manager-test /home/janpow/Projekte
 ProtectHome=true
 PrivateTmp=false
-NoNewPrivileges=no
+NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN
 AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_ADMIN
+MemoryMax=2G
+LimitNOFILE=65536
 
 # Docker socket access
 SupplementaryGroups=docker

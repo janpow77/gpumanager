@@ -117,6 +117,7 @@ impl AerWatcher {
     }
 
     /// Run the AER monitoring loop until cancelled.
+    /// Ueberwacht sowohl Non-Fatal als auch Correctable AER-Fehler.
     pub async fn run(
         mut self,
         monitor: Arc<dyn AerMonitor>,
@@ -128,6 +129,8 @@ impl AerWatcher {
             self.pci_address, self.poll_interval
         );
 
+        let mut correctable_baseline: Option<u64> = None;
+
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -135,6 +138,7 @@ impl AerWatcher {
                     return;
                 }
                 _ = tokio::time::sleep(self.poll_interval) => {
+                    // Non-Fatal AER-Zaehler
                     match monitor.read_nonfatal_count(&self.pci_address).await {
                         Ok(count) => {
                             let triggers = self.process_reading(count);
@@ -147,6 +151,40 @@ impl AerWatcher {
                         }
                         Err(e) => {
                             warn!("AER-Zähler nicht lesbar für {}: {e}", self.pci_address);
+                        }
+                    }
+
+                    // FIX 13: Correctable AER-Zaehler als Health-Score-Events
+                    match monitor.read_correctable_count(&self.pci_address).await {
+                        Ok(count) => {
+                            match correctable_baseline {
+                                None => {
+                                    correctable_baseline = Some(count);
+                                    debug!("AER-Correctable-Baseline: {} fuer {}", count, self.pci_address);
+                                }
+                                Some(baseline) => {
+                                    if count < baseline {
+                                        correctable_baseline = Some(count);
+                                    } else {
+                                        let delta = count - baseline;
+                                        correctable_baseline = Some(count);
+                                        if delta > 0 {
+                                            debug!(
+                                                "AER-Correctable: +{} fuer {} (Gesamt: {})",
+                                                delta, self.pci_address, count
+                                            );
+                                            // Correctable Fehler als AerThreshold melden
+                                            // (Health-Score wird in handle_trigger aufgezeichnet)
+                                            if delta >= self.warning_threshold {
+                                                let _ = trigger_tx.send(WarningTrigger::AerThreshold).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Correctable-Zaehler sind optional
                         }
                     }
                 }

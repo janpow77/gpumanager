@@ -19,7 +19,7 @@ impl NvidiaSmiMonitor {
     pub async fn query_all(&self) -> Result<Vec<GpuStatus>, GpuError> {
         let output = self
             .run_nvidia_smi(&[
-                "--query-gpu=gpu_bus_id,index,name,temperature.gpu,utilization.gpu,utilization.memory,memory.used,memory.free,memory.total,power.draw,pstate",
+                "--query-gpu=gpu_bus_id,index,name,temperature.gpu,utilization.gpu,utilization.memory,memory.used,memory.free,memory.total,power.draw,pstate,fan.speed,clocks.current.graphics,clocks.current.memory,gpu_operation_mode.current",
                 "--format=csv,noheader,nounits",
             ])
             .await?;
@@ -135,8 +135,8 @@ fn parse_gpu_status_output(output: &str) -> Result<Vec<GpuStatus>, GpuError> {
         }
 
         let parts: Vec<&str> = line.split(", ").collect();
-        if parts.len() < 11 {
-            warn!("nvidia-smi Zeile hat zu wenige Felder ({}/11): {line}", parts.len());
+        if parts.len() < 15 {
+            warn!("nvidia-smi Zeile hat zu wenige Felder ({}/15): {line}", parts.len());
             continue;
         }
 
@@ -151,6 +151,11 @@ fn parse_gpu_status_output(output: &str) -> Result<Vec<GpuStatus>, GpuError> {
         let memory_total_mb = parse_u64(parts[8]);
         let power_draw_w = parts[9].trim().parse::<f64>().unwrap_or(0.0);
         let pstate = parts[10].trim().to_string();
+        let fan_speed_percent = parse_u32(parts[11]);
+        let clock_graphics_mhz = parse_u32(parts[12]);
+        let clock_memory_mhz = parse_u32(parts[13]);
+        // gpu_operation_mode als Throttle-Reason (z.B. "All On", "Compute", "[N/A]")
+        let throttle_reason = parts[14].trim().to_string();
 
         gpus.push(GpuStatus {
             pci_address,
@@ -164,6 +169,10 @@ fn parse_gpu_status_output(output: &str) -> Result<Vec<GpuStatus>, GpuError> {
             memory_total_mb,
             power_draw_w,
             pstate,
+            fan_speed_percent,
+            clock_graphics_mhz,
+            clock_memory_mhz,
+            throttle_reason,
             status: GpuOnlineStatus::Online,
         });
     }
@@ -264,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_parse_gpu_status() {
-        let output = "00000000:02:00.0, 0, NVIDIA GeForce RTX 5060 Laptop GPU, 42, 0 %, 0 %, 15 MiB, 7692 MiB, 8151 MiB, 4.82 W, P8\n00000000:05:00.0, 1, NVIDIA GeForce RTX 5070 Ti, 45, 0 %, 0 %, 15788 MiB, 53 MiB, 16303 MiB, 22.73 W, P8\n";
+        let output = "00000000:02:00.0, 0, NVIDIA GeForce RTX 5060 Laptop GPU, 42, 0 %, 0 %, 15 MiB, 7692 MiB, 8151 MiB, 4.82 W, P8, 0 %, 210 MHz, 405 MHz, All On\n00000000:05:00.0, 1, NVIDIA GeForce RTX 5070 Ti, 45, 0 %, 0 %, 15788 MiB, 53 MiB, 16303 MiB, 22.73 W, P8, 30 %, 210 MHz, 405 MHz, All On\n";
 
         let gpus = parse_gpu_status_output(output).unwrap();
         assert_eq!(gpus.len(), 2);
