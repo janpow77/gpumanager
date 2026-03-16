@@ -2,11 +2,11 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use egpu_manager_common::config::Config;
+use egpu_manager_common::config::{Config, PipelineConfig, RemoteGpuConfig};
 use egpu_manager_common::gpu::{GpuStatus, GpuType, OllamaModel, PcieThroughput, WarningLevel};
 use egpu_manager_common::hal::{AerMonitor, OllamaControl, PcieLinkMonitor};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -18,13 +18,23 @@ use crate::health_score::{HealthEventKind, LinkHealthScore};
 use crate::kmsg::KmsgMonitor;
 use crate::link_health::LinkHealthWatcher;
 use crate::nvidia::NvidiaSmiMonitor;
-use crate::recovery::{get_egpu_pipelines, RecoveryStateMachine};
+use crate::recovery::{RecoveryStateMachine, get_egpu_pipelines};
 use crate::scheduler::{AdmissionState, GpuCapacity, GpuTarget, ScheduleRequest, VramScheduler};
 use crate::sysfs::{SysfsAerMonitor, SysfsLinkMonitor};
 use crate::warning::{WarningStateMachine, WarningTrigger};
 use crate::web::sse::{BroadcastEvent, SseBroadcaster};
 
+const EGPU_PROTECTION_HEADROOM_MB: u64 = 1024;
+
 /// A GPU lease granted to an application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseTargetKind {
+    Egpu,
+    Internal,
+    Remote,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuLease {
     pub lease_id: String,
@@ -35,6 +45,21 @@ pub struct GpuLease {
     pub workload_type: String,
     pub acquired_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    pub target_kind: LeaseTargetKind,
+    #[serde(default)]
+    pub nvidia_index: Option<u32>,
+    #[serde(default)]
+    pub nvidia_visible_devices: Option<String>,
+    #[serde(default)]
+    pub assignment_source: String,
+    #[serde(default)]
+    pub remote_gpu_name: Option<String>,
+    #[serde(default)]
+    pub remote_host: Option<String>,
+    #[serde(default)]
+    pub remote_ollama_url: Option<String>,
+    #[serde(default)]
+    pub remote_agent_url: Option<String>,
 }
 
 /// A registered remote GPU node (from LAN registration via port 7843).
@@ -74,16 +99,49 @@ pub struct MonitorOrchestrator {
     sse: Option<SseBroadcaster>,
 }
 
+#[derive(Debug, Clone)]
+struct RemoteLeaseCandidate {
+    name: String,
+    host: String,
+    port_ollama: u16,
+    port_agent: u16,
+    available_vram_mb: u64,
+    latency_ms: Option<u32>,
+    priority: u32,
+}
+
+#[derive(Debug, Clone)]
+enum LeasePlacement {
+    Local {
+        target: GpuTarget,
+        assignment_source: String,
+    },
+    Remote(RemoteLeaseCandidate),
+}
+
+#[derive(Debug, Clone)]
+pub struct GpuRecommendation {
+    pub recommended_gpu: String,
+    pub recommended_device: String,
+    pub assignment_source: String,
+    pub target_kind: LeaseTargetKind,
+    pub gpu_uuid: Option<String>,
+    pub nvidia_index: Option<u32>,
+    pub nvidia_visible_devices: Option<String>,
+    pub remote_gpu_name: Option<String>,
+    pub remote_host: Option<String>,
+    pub remote_ollama_url: Option<String>,
+    pub remote_agent_url: Option<String>,
+    pub egpu_vram_available_mb: u64,
+    pub internal_vram_available_mb: u64,
+    pub remote_vram_available_mb: Option<u64>,
+}
+
 impl MonitorOrchestrator {
-    pub fn new(
-        config: Config,
-        db: EventDb,
-        cancel: CancellationToken,
-    ) -> Self {
+    pub fn new(config: Config, db: EventDb, cancel: CancellationToken) -> Self {
         let config = Arc::new(config);
 
-        let warning_machine =
-            WarningStateMachine::new(config.gpu.warning_cooldown_seconds);
+        let warning_machine = WarningStateMachine::new(config.gpu.warning_cooldown_seconds);
 
         let scheduler = VramScheduler::new(
             GpuCapacity {
@@ -211,12 +269,7 @@ impl MonitorOrchestrator {
         let retention_config = Arc::clone(&self.config);
         let retention_cancel = self.cancel.clone();
         tokio::spawn(async move {
-            Self::retention_loop(
-                db_clone,
-                retention_config,
-                retention_cancel,
-            )
-            .await;
+            Self::retention_loop(db_clone, retention_config, retention_cancel).await;
         });
 
         // FIX 7: Spawn CUDA watchdog task
@@ -297,11 +350,15 @@ impl MonitorOrchestrator {
                 || *t == WarningTrigger::LinkSpeedDegradation
                 || *t == WarningTrigger::LinkDown =>
             {
-                state.health_score.record_event(HealthEventKind::PcieTransient);
+                state
+                    .health_score
+                    .record_event(HealthEventKind::PcieTransient);
             }
             // FIX 11: CmpltToPattern und GpuProgressError ebenfalls als PCIe-Transient werten
             t if *t == WarningTrigger::CmpltToPattern || *t == WarningTrigger::GpuProgressError => {
-                state.health_score.record_event(HealthEventKind::PcieTransient);
+                state
+                    .health_score
+                    .record_event(HealthEventKind::PcieTransient);
             }
             _ => {}
         }
@@ -345,7 +402,11 @@ impl MonitorOrchestrator {
                     &self.config,
                     &format!("eGPU Warnstufe: {new_level}"),
                     &format!("Ausloeser: {trigger_str}"),
-                    if new_level >= WarningLevel::Red { "urgent" } else { "high" },
+                    if new_level >= WarningLevel::Red {
+                        "urgent"
+                    } else {
+                        "high"
+                    },
                 );
             }
 
@@ -433,9 +494,8 @@ impl MonitorOrchestrator {
         let mut power_baseline: Option<f64> = None;
 
         // Proactive monitoring state
-        let mut smi_response_times: VecDeque<u128> = VecDeque::with_capacity(
-            config.gpu.nvidia_smi_response_avg_window as usize,
-        );
+        let mut smi_response_times: VecDeque<u128> =
+            VecDeque::with_capacity(config.gpu.nvidia_smi_response_avg_window as usize);
         let mut pstate_p4_since: Option<std::time::Instant> = None;
         let mut last_temp: Option<(u32, std::time::Instant)> = None;
 
@@ -448,7 +508,10 @@ impl MonitorOrchestrator {
             }
         });
 
-        info!("GPU-Poller gestartet (Intervall: {}s)", config.gpu.poll_interval_seconds);
+        info!(
+            "GPU-Poller gestartet (Intervall: {}s)",
+            config.gpu.poll_interval_seconds
+        );
 
         loop {
             // Compute adaptive poll interval based on current warning level
@@ -964,10 +1027,7 @@ impl MonitorOrchestrator {
     }
 
     /// Lease expiry loop: removes expired leases.
-    async fn lease_expiry_loop(
-        state: Arc<Mutex<MonitorState>>,
-        cancel: CancellationToken,
-    ) {
+    async fn lease_expiry_loop(state: Arc<Mutex<MonitorState>>, cancel: CancellationToken) {
         let interval = std::time::Duration::from_secs(5);
         loop {
             tokio::select! {
@@ -987,6 +1047,9 @@ impl MonitorOrchestrator {
 
                     for id in expired {
                         if let Some(lease) = st.active_leases.remove(&id) {
+                            if lease.target_kind != LeaseTargetKind::Remote {
+                                st.scheduler.release_lease(&id);
+                            }
                             info!(
                                 "Lease {} abgelaufen (Pipeline: {}, VRAM: {} MB)",
                                 id, lease.pipeline, lease.vram_mb
@@ -1035,10 +1098,7 @@ impl MonitorOrchestrator {
             config.docker.container_stop_timeout_seconds,
         );
 
-        let mut rsm = RecoveryStateMachine::new(
-            db.clone(),
-            config.recovery.reset_cooldown_seconds,
-        );
+        let mut rsm = RecoveryStateMachine::new(db.clone(), config.recovery.reset_cooldown_seconds);
 
         if let Err(e) = rsm.start_recovery(affected_pipelines).await {
             error!("Recovery-Start fehlgeschlagen: {e}");
@@ -1072,11 +1132,7 @@ impl MonitorOrchestrator {
         st.recovery_active = false;
     }
 
-    async fn retention_loop(
-        db: EventDb,
-        config: Arc<Config>,
-        cancel: CancellationToken,
-    ) {
+    async fn retention_loop(db: EventDb, config: Arc<Config>, cancel: CancellationToken) {
         let retention_days = config.database.retention_days;
         let aggregate_days = config.database.aggregate_after_days;
         let interval_hours = config.database.retention_check_interval_hours;
@@ -1251,6 +1307,305 @@ fn is_egpu_present(pci_address: &str) -> bool {
     std::path::Path::new(&format!("/sys/bus/pci/devices/{pci_address}/vendor")).exists()
 }
 
+fn find_pipeline_config<'a>(config: &'a Config, pipeline: &str) -> Option<&'a PipelineConfig> {
+    config.pipeline.iter().find(|p| p.container == pipeline)
+}
+
+fn remote_gpu_config<'a>(config: &'a Config, name: &str) -> Option<&'a RemoteGpuConfig> {
+    config.remote_gpu.iter().find(|r| r.name == name)
+}
+
+fn local_target_kind(target: GpuTarget) -> LeaseTargetKind {
+    match target {
+        GpuTarget::Egpu => LeaseTargetKind::Egpu,
+        GpuTarget::Internal => LeaseTargetKind::Internal,
+    }
+}
+
+fn local_available_vram(st: &MonitorState, target: GpuTarget) -> u64 {
+    match target {
+        GpuTarget::Egpu if !st.scheduler.egpu_available() => 0,
+        _ => st.scheduler.vram_available(target),
+    }
+}
+
+fn remote_reserved_vram(st: &MonitorState, remote_name: &str) -> u64 {
+    st.active_leases
+        .values()
+        .filter(|lease| {
+            lease.target_kind == LeaseTargetKind::Remote
+                && lease.remote_gpu_name.as_deref() == Some(remote_name)
+        })
+        .map(|lease| lease.vram_mb)
+        .sum()
+}
+
+fn workload_is_remote_capable(config: &Config, pipeline: &str, workload_type: &str) -> bool {
+    let Some(pipeline_cfg) = find_pipeline_config(config, pipeline) else {
+        return false;
+    };
+
+    pipeline_cfg
+        .remote_capable
+        .iter()
+        .any(|w| w == workload_type)
+        && !pipeline_cfg.cuda_only.iter().any(|w| w == workload_type)
+}
+
+fn pipeline_priority(config: &Config, pipeline: &str) -> u32 {
+    find_pipeline_config(config, pipeline)
+        .map(|p| p.gpu_priority)
+        .unwrap_or(3)
+}
+
+fn find_best_remote_candidate(
+    st: &MonitorState,
+    config: &Config,
+    workload_type: &str,
+    vram_mb: u64,
+) -> Option<RemoteLeaseCandidate> {
+    let mut candidates: Vec<RemoteLeaseCandidate> = st
+        .remote_gpus
+        .iter()
+        .filter(|gpu| gpu.status == "online")
+        .filter_map(|gpu| {
+            let cfg = remote_gpu_config(config, &gpu.name);
+            let total_vram = if gpu.vram_mb > 0 {
+                gpu.vram_mb
+            } else {
+                cfg.map(|r| r.vram_mb).unwrap_or(0)
+            };
+            let available_vram_mb = total_vram.saturating_sub(remote_reserved_vram(st, &gpu.name));
+            if available_vram_mb < vram_mb {
+                return None;
+            }
+
+            if let Some(limit) = cfg
+                .and_then(|r| r.max_latency_ms.get(workload_type))
+                .copied()
+            {
+                let measured = gpu.latency_ms?;
+                if u64::from(measured) > limit {
+                    return None;
+                }
+            }
+
+            Some(RemoteLeaseCandidate {
+                name: gpu.name.clone(),
+                host: gpu.host.clone(),
+                port_ollama: gpu.port_ollama,
+                port_agent: gpu.port_agent,
+                available_vram_mb,
+                latency_ms: gpu.latency_ms,
+                priority: cfg.map(|r| r.priority).unwrap_or(u32::MAX),
+            })
+        })
+        .collect();
+
+    candidates.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| {
+                a.latency_ms
+                    .unwrap_or(u32::MAX)
+                    .cmp(&b.latency_ms.unwrap_or(u32::MAX))
+            })
+            .then_with(|| b.available_vram_mb.cmp(&a.available_vram_mb))
+    });
+
+    candidates.into_iter().next()
+}
+
+fn select_lease_placement(
+    st: &MonitorState,
+    config: &Config,
+    pipeline: &str,
+    workload_type: &str,
+    vram_mb: u64,
+) -> Option<LeasePlacement> {
+    let warning_level = st.warning_machine.current_level();
+    let priority = pipeline_priority(config, pipeline);
+    let egpu_available = local_available_vram(st, GpuTarget::Egpu);
+    let internal_available = local_available_vram(st, GpuTarget::Internal);
+    let remote_candidate = if workload_is_remote_capable(config, pipeline, workload_type) {
+        find_best_remote_candidate(st, config, workload_type, vram_mb)
+    } else {
+        None
+    };
+
+    let egpu_usable = st.scheduler.egpu_allows_priority(priority) && egpu_available >= vram_mb;
+    let internal_usable = internal_available >= vram_mb;
+
+    if warning_level >= WarningLevel::Yellow {
+        if let Some(remote) = remote_candidate {
+            return Some(LeasePlacement::Remote(remote));
+        }
+        if internal_usable {
+            return Some(LeasePlacement::Local {
+                target: GpuTarget::Internal,
+                assignment_source: "warning_fallback".to_string(),
+            });
+        }
+        return None;
+    }
+
+    if egpu_usable {
+        if let Some(remote) = remote_candidate
+            && egpu_available.saturating_sub(vram_mb) < EGPU_PROTECTION_HEADROOM_MB
+        {
+            return Some(LeasePlacement::Remote(remote));
+        }
+
+        return Some(LeasePlacement::Local {
+            target: GpuTarget::Egpu,
+            assignment_source: "preferred".to_string(),
+        });
+    }
+
+    if let Some(remote) = remote_candidate {
+        return Some(LeasePlacement::Remote(remote));
+    }
+
+    if internal_usable {
+        return Some(LeasePlacement::Local {
+            target: GpuTarget::Internal,
+            assignment_source: "fallback".to_string(),
+        });
+    }
+
+    None
+}
+
+pub fn recommend_gpu_placement(
+    st: &MonitorState,
+    config: &Config,
+    pipeline: Option<&str>,
+    workload_type: Option<&str>,
+    vram_mb: Option<u64>,
+) -> GpuRecommendation {
+    let egpu_vram_available_mb = local_available_vram(st, GpuTarget::Egpu);
+    let internal_vram_available_mb = local_available_vram(st, GpuTarget::Internal);
+
+    let workload_type = workload_type.unwrap_or("generic");
+    let pipeline = pipeline.unwrap_or("");
+    let requested_vram = vram_mb.unwrap_or(0);
+    let remote_candidate = if pipeline.is_empty() {
+        None
+    } else if workload_is_remote_capable(config, pipeline, workload_type) {
+        find_best_remote_candidate(st, config, workload_type, requested_vram)
+    } else {
+        None
+    };
+
+    if !pipeline.is_empty() {
+        if let Some(placement) =
+            select_lease_placement(st, config, pipeline, workload_type, requested_vram)
+        {
+            return match placement {
+                LeasePlacement::Local {
+                    target,
+                    assignment_source,
+                } => {
+                    let gpu_device = match target {
+                        GpuTarget::Egpu => config.gpu.egpu_pci_address.clone(),
+                        GpuTarget::Internal => config.gpu.internal_pci_address.clone(),
+                    };
+                    let gpu_info = st.gpu_status.iter().find(|g| g.pci_address == gpu_device);
+                    GpuRecommendation {
+                        recommended_gpu: match target {
+                            GpuTarget::Egpu => "egpu".to_string(),
+                            GpuTarget::Internal => "internal".to_string(),
+                        },
+                        recommended_device: gpu_device,
+                        assignment_source,
+                        target_kind: local_target_kind(target),
+                        gpu_uuid: gpu_info.map(|g| g.gpu_uuid.clone()),
+                        nvidia_index: gpu_info.and_then(|g| g.nvidia_index),
+                        nvidia_visible_devices: gpu_info.map(|g| g.gpu_uuid.clone()),
+                        remote_gpu_name: None,
+                        remote_host: None,
+                        remote_ollama_url: None,
+                        remote_agent_url: None,
+                        egpu_vram_available_mb,
+                        internal_vram_available_mb,
+                        remote_vram_available_mb: remote_candidate
+                            .as_ref()
+                            .map(|remote| remote.available_vram_mb),
+                    }
+                }
+                LeasePlacement::Remote(remote) => GpuRecommendation {
+                    recommended_gpu: "remote".to_string(),
+                    recommended_device: format!("remote://{}", remote.name),
+                    assignment_source: "remote".to_string(),
+                    target_kind: LeaseTargetKind::Remote,
+                    gpu_uuid: None,
+                    nvidia_index: None,
+                    nvidia_visible_devices: None,
+                    remote_gpu_name: Some(remote.name.clone()),
+                    remote_host: Some(remote.host.clone()),
+                    remote_ollama_url: Some(format!(
+                        "http://{}:{}",
+                        remote.host, remote.port_ollama
+                    )),
+                    remote_agent_url: Some(format!("http://{}:{}", remote.host, remote.port_agent)),
+                    egpu_vram_available_mb,
+                    internal_vram_available_mb,
+                    remote_vram_available_mb: Some(remote.available_vram_mb),
+                },
+            };
+        }
+    }
+
+    if st.scheduler.egpu_allows_priority(3) && egpu_vram_available_mb >= internal_vram_available_mb
+    {
+        let gpu_info = st
+            .gpu_status
+            .iter()
+            .find(|g| g.pci_address == config.gpu.egpu_pci_address);
+        GpuRecommendation {
+            recommended_gpu: "egpu".to_string(),
+            recommended_device: config.gpu.egpu_pci_address.clone(),
+            assignment_source: "generic".to_string(),
+            target_kind: LeaseTargetKind::Egpu,
+            gpu_uuid: gpu_info.map(|g| g.gpu_uuid.clone()),
+            nvidia_index: gpu_info.and_then(|g| g.nvidia_index),
+            nvidia_visible_devices: gpu_info.map(|g| g.gpu_uuid.clone()),
+            remote_gpu_name: None,
+            remote_host: None,
+            remote_ollama_url: None,
+            remote_agent_url: None,
+            egpu_vram_available_mb,
+            internal_vram_available_mb,
+            remote_vram_available_mb: remote_candidate
+                .as_ref()
+                .map(|remote| remote.available_vram_mb),
+        }
+    } else {
+        let gpu_info = st
+            .gpu_status
+            .iter()
+            .find(|g| g.pci_address == config.gpu.internal_pci_address);
+        GpuRecommendation {
+            recommended_gpu: "internal".to_string(),
+            recommended_device: config.gpu.internal_pci_address.clone(),
+            assignment_source: "generic".to_string(),
+            target_kind: LeaseTargetKind::Internal,
+            gpu_uuid: gpu_info.map(|g| g.gpu_uuid.clone()),
+            nvidia_index: gpu_info.and_then(|g| g.nvidia_index),
+            nvidia_visible_devices: gpu_info.map(|g| g.gpu_uuid.clone()),
+            remote_gpu_name: None,
+            remote_host: None,
+            remote_ollama_url: None,
+            remote_agent_url: None,
+            egpu_vram_available_mb,
+            internal_vram_available_mb,
+            remote_vram_available_mb: remote_candidate
+                .as_ref()
+                .map(|remote| remote.available_vram_mb),
+        }
+    }
+}
+
 /// Acquire a GPU lease. Returns the lease on success or a queue position.
 pub async fn acquire_gpu_lease(
     state: &Arc<Mutex<MonitorState>>,
@@ -1262,46 +1617,75 @@ pub async fn acquire_gpu_lease(
 ) -> Result<GpuLease, u32> {
     let mut st = state.lock().await;
 
-    let warning_level = st.warning_machine.current_level();
-
-    // Try to find a GPU with available VRAM
-    let egpu_available = st.scheduler.vram_available(GpuTarget::Egpu);
-    let internal_available = st.scheduler.vram_available(GpuTarget::Internal);
-
-    let target = if warning_level < WarningLevel::Yellow && egpu_available >= vram_mb {
-        Some(GpuTarget::Egpu)
-    } else if internal_available >= vram_mb {
-        Some(GpuTarget::Internal)
-    } else {
-        None
-    };
-
-    match target {
-        Some(gpu_target) => {
+    match select_lease_placement(&st, config, &pipeline, &workload_type, vram_mb) {
+        Some(LeasePlacement::Local {
+            target,
+            assignment_source,
+        }) => {
             let now = Utc::now();
             let lease_id = Uuid::new_v4().to_string();
-            let gpu_device = match gpu_target {
+            let gpu_device = match target {
                 GpuTarget::Egpu => config.gpu.egpu_pci_address.clone(),
                 GpuTarget::Internal => config.gpu.internal_pci_address.clone(),
             };
 
-            // Echte GPU UUID aus MonitorState.gpu_status holen
-            let gpu_uuid = st
+            // Echte GPU UUID + nvidia_index aus MonitorState.gpu_status holen
+            let (gpu_uuid, nvidia_index) = st
                 .gpu_status
                 .iter()
                 .find(|g| g.pci_address == gpu_device)
-                .map(|g| g.gpu_uuid.clone())
+                .map(|g| (g.gpu_uuid.clone(), g.nvidia_index))
                 .unwrap_or_default();
 
             let lease = GpuLease {
                 lease_id: lease_id.clone(),
                 pipeline,
                 gpu_device,
-                gpu_uuid,
+                gpu_uuid: gpu_uuid.clone(),
                 vram_mb,
                 workload_type,
                 acquired_at: now,
                 expires_at: now + chrono::Duration::seconds(duration_seconds as i64),
+                target_kind: local_target_kind(target),
+                nvidia_index,
+                nvidia_visible_devices: if gpu_uuid.is_empty() {
+                    None
+                } else {
+                    Some(gpu_uuid)
+                },
+                assignment_source,
+                remote_gpu_name: None,
+                remote_host: None,
+                remote_ollama_url: None,
+                remote_agent_url: None,
+            };
+
+            st.scheduler
+                .reserve_lease(lease_id.clone(), target, vram_mb);
+            st.active_leases.insert(lease_id, lease.clone());
+            Ok(lease)
+        }
+        Some(LeasePlacement::Remote(remote)) => {
+            let now = Utc::now();
+            let lease_id = Uuid::new_v4().to_string();
+
+            let lease = GpuLease {
+                lease_id: lease_id.clone(),
+                pipeline,
+                gpu_device: format!("remote://{}", remote.name),
+                gpu_uuid: String::new(),
+                vram_mb,
+                workload_type,
+                acquired_at: now,
+                expires_at: now + chrono::Duration::seconds(duration_seconds as i64),
+                target_kind: LeaseTargetKind::Remote,
+                nvidia_index: None,
+                nvidia_visible_devices: None,
+                assignment_source: "remote".to_string(),
+                remote_gpu_name: Some(remote.name.clone()),
+                remote_host: Some(remote.host.clone()),
+                remote_ollama_url: Some(format!("http://{}:{}", remote.host, remote.port_ollama)),
+                remote_agent_url: Some(format!("http://{}:{}", remote.host, remote.port_agent)),
             };
 
             st.active_leases.insert(lease_id, lease.clone());
@@ -1316,11 +1700,15 @@ pub async fn acquire_gpu_lease(
 }
 
 /// Release a GPU lease.
-pub fn release_gpu_lease(
-    state: &mut MonitorState,
-    lease_id: &str,
-) -> bool {
-    state.active_leases.remove(lease_id).is_some()
+pub fn release_gpu_lease(state: &mut MonitorState, lease_id: &str) -> bool {
+    if let Some(lease) = state.active_leases.remove(lease_id) {
+        if lease.target_kind != LeaseTargetKind::Remote {
+            state.scheduler.release_lease(lease_id);
+        }
+        true
+    } else {
+        false
+    }
 }
 
 /// Sendet eine ntfy-Benachrichtigung (fire-and-forget).

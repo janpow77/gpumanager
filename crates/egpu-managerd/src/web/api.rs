@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::db::Severity;
-use crate::monitor::{acquire_gpu_lease, release_gpu_lease};
+use crate::monitor::{acquire_gpu_lease, recommend_gpu_placement, release_gpu_lease};
 use crate::scheduler::{AdmissionState, GpuTarget};
-use crate::web::sse::BroadcastEvent;
 use crate::web::AppState;
+use crate::web::sse::BroadcastEvent;
 
 // ─── Request / Response types ────────────────────────────────────────────
 
@@ -82,6 +82,25 @@ fn default_lease_duration() -> u64 {
 #[derive(Debug, Deserialize)]
 pub struct GpuReleaseBody {
     pub lease_id: String,
+    #[serde(default)]
+    pub actual_vram_mb: Option<u64>,
+    #[serde(default)]
+    pub actual_duration_seconds: Option<u64>,
+    #[serde(default)]
+    pub success: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecommendQuery {
+    pub pipeline: Option<String>,
+    pub workload_type: Option<String>,
+    pub vram_mb: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SetupGenerateBody {
+    pub remote_name: Option<String>,
+    pub nuc_host: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -222,16 +241,15 @@ pub async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
             };
 
             // Enrich with PCIe throughput data from MonitorState
-            let (pcie_tx, pcie_rx, bw_util) =
-                if let Some(tp) = monitor_state.pcie_throughput.get(&g.pci_address) {
-                    let max_throughput_kbps: u64 = 1_000_000;
-                    let util = (tp.tx_kbps + tp.rx_kbps) as f64
-                        / max_throughput_kbps as f64
-                        * 100.0;
-                    (Some(tp.tx_kbps), Some(tp.rx_kbps), Some(util))
-                } else {
-                    (None, None, None)
-                };
+            let (pcie_tx, pcie_rx, bw_util) = if let Some(tp) =
+                monitor_state.pcie_throughput.get(&g.pci_address)
+            {
+                let max_throughput_kbps: u64 = 1_000_000;
+                let util = (tp.tx_kbps + tp.rx_kbps) as f64 / max_throughput_kbps as f64 * 100.0;
+                (Some(tp.tx_kbps), Some(tp.rx_kbps), Some(util))
+            } else {
+                (None, None, None)
+            };
 
             GpuInfo {
                 pci_address: g.pci_address.clone(),
@@ -365,7 +383,13 @@ pub async fn get_pipelines(State(state): State<Arc<AppState>>) -> impl IntoRespo
                     .to_string(),
                 )
             } else {
-                ("none".to_string(), "unassigned".to_string(), 0u64, "n/a".to_string(), "n/a".to_string())
+                (
+                    "none".to_string(),
+                    "unassigned".to_string(),
+                    0u64,
+                    "n/a".to_string(),
+                    "n/a".to_string(),
+                )
             };
 
         let queue_position = monitor_state
@@ -375,14 +399,13 @@ pub async fn get_pipelines(State(state): State<Arc<AppState>>) -> impl IntoRespo
             .position(|r| r.name == cfg.container);
 
         let warning_level = monitor_state.warning_machine.current_level();
-        let blocked_by =
-            if warning_level >= egpu_manager_common::gpu::WarningLevel::Yellow
-                && cfg.gpu_device == config.gpu.egpu_pci_address
-            {
-                Some(format!("warning_level:{warning_level}"))
-            } else {
-                None
-            };
+        let blocked_by = if warning_level >= egpu_manager_common::gpu::WarningLevel::Yellow
+            && cfg.gpu_device == config.gpu.egpu_pci_address
+        {
+            Some(format!("warning_level:{warning_level}"))
+        } else {
+            None
+        };
 
         pipelines.push(PipelineInfo {
             project: cfg.project.clone(),
@@ -415,14 +438,14 @@ pub async fn get_pipeline(
     Path(container): Path<String>,
 ) -> impl IntoResponse {
     let config = state.config.load();
-    let pipeline_cfg = config
-        .pipeline
-        .iter()
-        .find(|p| p.container == container);
+    let pipeline_cfg = config.pipeline.iter().find(|p| p.container == container);
 
     let Some(cfg) = pipeline_cfg else {
-        return api_error(StatusCode::NOT_FOUND, format!("Pipeline '{container}' nicht gefunden"))
-            .into_response();
+        return api_error(
+            StatusCode::NOT_FOUND,
+            format!("Pipeline '{container}' nicht gefunden"),
+        )
+        .into_response();
     };
 
     let monitor_state = state.monitor_state.lock().await;
@@ -445,7 +468,13 @@ pub async fn get_pipeline(
                 .to_string(),
             )
         } else {
-            ("none".to_string(), "unassigned".to_string(), 0u64, "n/a".to_string(), "n/a".to_string())
+            (
+                "none".to_string(),
+                "unassigned".to_string(),
+                0u64,
+                "n/a".to_string(),
+                "n/a".to_string(),
+            )
         };
 
     let queue_position = monitor_state
@@ -455,14 +484,13 @@ pub async fn get_pipeline(
         .position(|r| r.name == cfg.container);
 
     let warning_level = monitor_state.warning_machine.current_level();
-    let blocked_by =
-        if warning_level >= egpu_manager_common::gpu::WarningLevel::Yellow
-            && cfg.gpu_device == config.gpu.egpu_pci_address
-        {
-            Some(format!("warning_level:{warning_level}"))
-        } else {
-            None
-        };
+    let blocked_by = if warning_level >= egpu_manager_common::gpu::WarningLevel::Yellow
+        && cfg.gpu_device == config.gpu.egpu_pci_address
+    {
+        Some(format!("warning_level:{warning_level}"))
+    } else {
+        None
+    };
 
     let info = PipelineInfo {
         project: cfg.project.clone(),
@@ -542,13 +570,13 @@ pub async fn put_pipeline_priority(
             .await
             .ok();
 
-        state.sse.send(BroadcastEvent::PipelineChange(
-            serde_json::json!({
+        state
+            .sse
+            .send(BroadcastEvent::PipelineChange(serde_json::json!({
                 "container": container,
                 "action": "priority_change",
                 "priority": body.priority,
-            }),
-        ));
+            })));
 
         Json(serde_json::json!({
             "ok": true,
@@ -613,13 +641,13 @@ pub async fn post_pipeline_assign(
             .await
             .ok();
 
-        state.sse.send(BroadcastEvent::PipelineChange(
-            serde_json::json!({
+        state
+            .sse
+            .send(BroadcastEvent::PipelineChange(serde_json::json!({
                 "container": container,
                 "action": "gpu_assign",
                 "target": format!("{target}"),
-            }),
-        ));
+            })));
 
         Json(serde_json::json!({
             "ok": true,
@@ -715,9 +743,22 @@ pub async fn post_gpu_acquire(
                 "granted": true,
                 "gpu_device": lease.gpu_device,
                 "gpu_uuid": lease.gpu_uuid,
+                "nvidia_index": lease.nvidia_index,
+                "nvidia_visible_devices": lease.nvidia_visible_devices,
                 "lease_id": lease.lease_id,
+                "assignment_source": lease.assignment_source,
+                "target_kind": lease.target_kind,
+                "remote_gpu_name": lease.remote_gpu_name,
+                "remote_host": lease.remote_host,
+                "remote_ollama_url": lease.remote_ollama_url,
+                "remote_agent_url": lease.remote_agent_url,
                 "warning_level": format!("{warning_level}"),
                 "expires_at": lease.expires_at.to_rfc3339(),
+                "message": if lease.remote_gpu_name.is_some() {
+                    "Remote-GPU zugewiesen"
+                } else {
+                    "Lokale GPU zugewiesen"
+                },
             }))
             .into_response()
         }
@@ -729,9 +770,12 @@ pub async fn post_gpu_acquire(
 
             Json(serde_json::json!({
                 "granted": false,
+                "gpu_device": null,
+                "lease_id": null,
                 "queue_position": queue_position,
                 "warning_level": format!("{warning_level}"),
                 "reason": "Nicht genuegend VRAM verfuegbar",
+                "message": "Kein passendes GPU-Ziel verfuegbar",
             }))
             .into_response()
         }
@@ -759,6 +803,9 @@ pub async fn post_gpu_release(
                 &format!("GPU-Lease freigegeben: {}", body.lease_id),
                 Some(serde_json::json!({
                     "lease_id": body.lease_id,
+                    "actual_vram_mb": body.actual_vram_mb,
+                    "actual_duration_seconds": body.actual_duration_seconds,
+                    "success": body.success,
                 })),
             )
             .await
@@ -767,6 +814,9 @@ pub async fn post_gpu_release(
         Json(serde_json::json!({
             "ok": true,
             "lease_id": body.lease_id,
+            "actual_vram_mb": body.actual_vram_mb,
+            "actual_duration_seconds": body.actual_duration_seconds,
+            "success": body.success,
         }))
         .into_response()
     } else {
@@ -780,27 +830,20 @@ pub async fn post_gpu_release(
 
 // ─── GET /api/gpu/recommend (Gap 4) ──────────────────────────────────────
 
-pub async fn get_gpu_recommend(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn get_gpu_recommend(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RecommendQuery>,
+) -> impl IntoResponse {
     let cfg = state.config.load();
     let monitor_state = state.monitor_state.lock().await;
-
     let warning_level = monitor_state.warning_machine.current_level();
-    let egpu_available = monitor_state.scheduler.vram_available(GpuTarget::Egpu);
-    let internal_available = monitor_state.scheduler.vram_available(GpuTarget::Internal);
-
-    let recommended = if warning_level < egpu_manager_common::gpu::WarningLevel::Yellow
-        && egpu_available > internal_available
-    {
-        "egpu"
-    } else {
-        "internal"
-    };
-
-    let recommended_device = if recommended == "egpu" {
-        &cfg.gpu.egpu_pci_address
-    } else {
-        &cfg.gpu.internal_pci_address
-    };
+    let recommendation = recommend_gpu_placement(
+        &monitor_state,
+        &cfg,
+        query.pipeline.as_deref(),
+        query.workload_type.as_deref(),
+        query.vram_mb,
+    );
 
     // Get Ollama host if configured
     let ollama_host = cfg
@@ -810,12 +853,27 @@ pub async fn get_gpu_recommend(State(state): State<Arc<AppState>>) -> impl IntoR
         .map(|o| o.host.clone());
 
     Json(serde_json::json!({
-        "recommended_gpu": recommended,
-        "recommended_device": recommended_device,
+        "recommended_gpu": recommendation.recommended_gpu,
+        "recommended_device": recommendation.recommended_device,
+        "target_kind": recommendation.target_kind,
+        "assignment_source": recommendation.assignment_source,
+        "gpu_uuid": recommendation.gpu_uuid,
+        "nvidia_index": recommendation.nvidia_index,
+        "nvidia_visible_devices": recommendation.nvidia_visible_devices,
+        "remote_gpu_name": recommendation.remote_gpu_name,
+        "remote_host": recommendation.remote_host,
+        "remote_ollama_url": recommendation.remote_ollama_url,
+        "remote_agent_url": recommendation.remote_agent_url,
         "warning_level": format!("{warning_level}"),
-        "egpu_vram_available_mb": egpu_available,
-        "internal_vram_available_mb": internal_available,
+        "egpu_vram_available_mb": recommendation.egpu_vram_available_mb,
+        "internal_vram_available_mb": recommendation.internal_vram_available_mb,
+        "remote_vram_available_mb": recommendation.remote_vram_available_mb,
         "ollama_host": ollama_host,
+        "query": {
+            "pipeline": query.pipeline,
+            "workload_type": query.workload_type,
+            "vram_mb": query.vram_mb,
+        },
         "active_leases": monitor_state.active_leases.len(),
     }))
 }
@@ -859,10 +917,7 @@ pub async fn post_egpu_admission(
         .log_event(
             "api.egpu_admission",
             Severity::Warning,
-            &format!(
-                "eGPU-Admission geaendert: {} -> {}",
-                old_state, new_state
-            ),
+            &format!("eGPU-Admission geaendert: {} -> {}", old_state, new_state),
             Some(serde_json::json!({
                 "old_state": format!("{old_state}"),
                 "new_state": format!("{new_state}"),
@@ -872,13 +927,13 @@ pub async fn post_egpu_admission(
         .await
         .ok();
 
-    state.sse.send(BroadcastEvent::PipelineChange(
-        serde_json::json!({
+    state
+        .sse
+        .send(BroadcastEvent::PipelineChange(serde_json::json!({
             "action": "egpu_admission_change",
             "old_state": format!("{old_state}"),
             "new_state": format!("{new_state}"),
-        }),
-    ));
+        })));
 
     Json(serde_json::json!({
         "ok": true,
@@ -907,7 +962,11 @@ pub async fn get_ollama_status(State(state): State<Arc<AppState>>) -> impl IntoR
     // Return cached Ollama models from MonitorState if available
     let monitor_state = state.monitor_state.lock().await;
     if !monitor_state.ollama_models.is_empty() {
-        let total_vram: u64 = monitor_state.ollama_models.iter().map(|m| m.size_vram_bytes).sum();
+        let total_vram: u64 = monitor_state
+            .ollama_models
+            .iter()
+            .map(|m| m.size_vram_bytes)
+            .sum();
         return Json(serde_json::json!({
             "enabled": true,
             "host": ollama_cfg.host,
@@ -932,10 +991,11 @@ pub async fn get_ollama_status(State(state): State<Arc<AppState>>) -> impl IntoR
             }))
             .into_response()
         }
-        Err(e) => {
-            api_error(StatusCode::BAD_GATEWAY, format!("Ollama nicht erreichbar: {e}"))
-                .into_response()
-        }
+        Err(e) => api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("Ollama nicht erreichbar: {e}"),
+        )
+        .into_response(),
     }
 }
 
@@ -1001,20 +1061,16 @@ pub async fn post_ollama_unload(
 
             Json(serde_json::json!({"ok": true, "model": body.model})).into_response()
         }
-        Ok(resp) => {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Ollama Fehler: HTTP {}", resp.status()),
-            )
-            .into_response()
-        }
-        Err(e) => {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Ollama nicht erreichbar: {e}"),
-            )
-            .into_response()
-        }
+        Ok(resp) => api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("Ollama Fehler: HTTP {}", resp.status()),
+        )
+        .into_response(),
+        Err(e) => api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("Ollama nicht erreichbar: {e}"),
+        )
+        .into_response(),
     }
 }
 
@@ -1036,13 +1092,11 @@ pub async fn get_recovery_status(State(state): State<Arc<AppState>>) -> impl Int
             "status": "idle",
         }))
         .into_response(),
-        Err(e) => {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Recovery-Status nicht lesbar: {e}"),
-            )
-            .into_response()
-        }
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Recovery-Status nicht lesbar: {e}"),
+        )
+        .into_response(),
     }
 }
 
@@ -1086,12 +1140,12 @@ pub async fn post_recovery_reset(
         .await
         .ok();
 
-    state.sse.send(BroadcastEvent::RecoveryStage(
-        serde_json::json!({
+    state
+        .sse
+        .send(BroadcastEvent::RecoveryStage(serde_json::json!({
             "action": "manual_reset_requested",
             "stage": "flr_reset",
-        }),
-    ));
+        })));
 
     Json(serde_json::json!({
         "ok": true,
@@ -1141,12 +1195,12 @@ pub async fn post_thunderbolt_reconnect(
         .await
         .ok();
 
-    state.sse.send(BroadcastEvent::RecoveryStage(
-        serde_json::json!({
+    state
+        .sse
+        .send(BroadcastEvent::RecoveryStage(serde_json::json!({
             "action": "thunderbolt_reconnect_requested",
             "stage": "tb_reauth",
-        }),
-    ));
+        })));
 
     Json(serde_json::json!({
         "ok": true,
@@ -1314,13 +1368,11 @@ pub async fn post_config_reload(
             }))
             .into_response()
         }
-        Err(e) => {
-            api_error(
-                StatusCode::BAD_REQUEST,
-                format!("Konfiguration ungueltig: {e}"),
-            )
-            .into_response()
-        }
+        Err(e) => api_error(
+            StatusCode::BAD_REQUEST,
+            format!("Konfiguration ungueltig: {e}"),
+        )
+        .into_response(),
     }
 }
 
@@ -1337,38 +1389,56 @@ pub async fn get_system_stats() -> impl IntoResponse {
 /// POST /api/setup/generate — Generate Windows Remote-Node setup ZIP
 pub async fn post_setup_generate(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<SetupGenerateBody>,
 ) -> impl IntoResponse {
-    match crate::setup_generator::generate_setup_zip() {
-        Ok(zip_bytes) => {
+    let cfg = state.config.load();
+    if let Err(resp) = check_bearer_auth(&headers, &cfg) {
+        return resp.into_response();
+    }
+
+    match crate::setup_generator::generate_setup_package(
+        &cfg,
+        crate::setup_generator::SetupGenerateRequest {
+            remote_name: body.remote_name.clone(),
+            nuc_host: body.nuc_host.clone(),
+        },
+    ) {
+        Ok(package) => {
             state
                 .db
                 .log_event(
                     "api.setup_generate",
                     Severity::Info,
                     &format!(
-                        "Windows-Setup-ZIP generiert ({} KB)",
-                        zip_bytes.len() / 1024
+                        "Windows-Setup-ZIP generiert: {} ({} KB)",
+                        package.filename,
+                        package.zip_bytes.len() / 1024
                     ),
-                    None,
+                    Some(serde_json::json!({
+                        "filename": package.filename,
+                        "remote_name": body.remote_name,
+                        "nuc_host": body.nuc_host,
+                    })),
                 )
                 .await
                 .ok();
 
-            (
-                StatusCode::OK,
-                [
-                    (
-                        axum::http::header::CONTENT_TYPE,
-                        "application/zip",
-                    ),
-                    (
-                        axum::http::header::CONTENT_DISPOSITION,
+            let mut response_headers = axum::http::HeaderMap::new();
+            response_headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/zip"),
+            );
+            let content_disposition = format!("attachment; filename=\"{}\"", package.filename);
+            let header_value = axum::http::HeaderValue::from_str(&content_disposition)
+                .unwrap_or_else(|_| {
+                    axum::http::HeaderValue::from_static(
                         "attachment; filename=\"egpu-remote-setup.zip\"",
-                    ),
-                ],
-                zip_bytes,
-            )
-                .into_response()
+                    )
+                });
+            response_headers.insert(axum::http::header::CONTENT_DISPOSITION, header_value);
+
+            (StatusCode::OK, response_headers, package.zip_bytes).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1384,14 +1454,16 @@ pub async fn post_setup_generate(
 pub async fn get_setup_instructions() -> impl IntoResponse {
     Json(serde_json::json!({
         "steps": [
-            "1. ZIP herunterladen (Button oder POST /api/setup/generate)",
+            "1. In der UI NUC-Host/IP und Remote-Node-Name eingeben",
+            "2. ZIP herunterladen (Button oder POST /api/setup/generate)",
             "2. ZIP auf USB-Stick kopieren",
             "3. Am Windows-11-Rechner: ZIP nach C:\\egpu-remote\\setup\\ entpacken",
             "4. PowerShell als Administrator oeffnen",
             "5. cd C:\\egpu-remote\\setup\\egpu-remote-setup",
             "6. Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass",
             "7. .\\install.ps1 ausfuehren",
-            "8. Remote-GPU erscheint im NUC-Dashboard"
+            "8. Heartbeat-Task registriert den Remote-Node automatisch am NUC",
+            "9. Remote-GPU erscheint im NUC-Dashboard"
         ],
         "requirements": [
             "Windows 11",
@@ -1412,8 +1484,11 @@ pub async fn post_llm_chat_completions(
     Json(request): Json<crate::llm::types::ChatCompletionRequest>,
 ) -> impl IntoResponse {
     let Some(ref router) = state.llm_router else {
-        return api_error(StatusCode::SERVICE_UNAVAILABLE, "LLM Gateway nicht konfiguriert")
-            .into_response();
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "LLM Gateway nicht konfiguriert",
+        )
+        .into_response();
     };
 
     let app_id = headers
@@ -1439,8 +1514,11 @@ pub async fn post_llm_chat_completions(
 /// GET /api/llm/providers — Liste aller konfigurierten LLM-Provider
 pub async fn get_llm_providers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let Some(ref router) = state.llm_router else {
-        return api_error(StatusCode::SERVICE_UNAVAILABLE, "LLM Gateway nicht konfiguriert")
-            .into_response();
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "LLM Gateway nicht konfiguriert",
+        )
+        .into_response();
     };
 
     let statuses = router.provider_status().await;
@@ -1453,8 +1531,11 @@ pub async fn get_llm_usage(
     Path(app_id): Path<String>,
 ) -> impl IntoResponse {
     let Some(ref router) = state.llm_router else {
-        return api_error(StatusCode::SERVICE_UNAVAILABLE, "LLM Gateway nicht konfiguriert")
-            .into_response();
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "LLM Gateway nicht konfiguriert",
+        )
+        .into_response();
     };
 
     let summary = router.usage_for_app(&app_id).await;
@@ -1523,7 +1604,10 @@ pub fn check_bearer_auth(
                 Err(api_error(StatusCode::FORBIDDEN, "Ungueltiger API-Token"))
             }
         }
-        _ => Err(api_error(StatusCode::UNAUTHORIZED, "Bearer-Token erforderlich")),
+        _ => Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "Bearer-Token erforderlich",
+        )),
     }
 }
 
@@ -1587,6 +1671,22 @@ pub async fn get_discover(State(state): State<Arc<AppState>>) -> impl IntoRespon
             })
         })
         .collect();
+    let remote_gpus: Vec<serde_json::Value> = monitor_state
+        .remote_gpus
+        .iter()
+        .map(|g| {
+            serde_json::json!({
+                "name": g.name,
+                "host": g.host,
+                "gpu_name": g.gpu_name,
+                "vram_mb": g.vram_mb,
+                "status": g.status,
+                "latency_ms": g.latency_ms,
+                "remote_ollama_url": format!("http://{}:{}", g.host, g.port_ollama),
+                "remote_agent_url": format!("http://{}:{}", g.host, g.port_agent),
+            })
+        })
+        .collect();
 
     let port = cfg.local_api.port;
     let llm_gateway_active = state.llm_router.is_some();
@@ -1614,14 +1714,16 @@ pub async fn get_discover(State(state): State<Arc<AppState>>) -> impl IntoRespon
             }
         },
         "gpus": gpus,
+        "remote_gpus": remote_gpus,
         "egpu_pci_address": cfg.gpu.egpu_pci_address,
         "internal_pci_address": cfg.gpu.internal_pci_address,
         "recommended_workflow": {
             "step_1": "GET /api/v1/discover — API kennenlernen, GPUs + UUIDs abrufen",
-            "step_2": "POST /api/gpu/acquire — Lease anfordern (liefert gpu_uuid + nvidia_index)",
-            "step_3": "Im Worker: cuda:{nvidia_index} als Device nutzen",
-            "step_4": "POST /api/gpu/release — Lease freigeben wenn fertig",
-            "note": "NVIDIA_VISIBLE_DEVICES ist ein Startzeit-Mechanismus. Fuer Laufzeit-Switching: Lease-basiertes Device-Mapping ueber nvidia_index verwenden."
+            "step_2": "POST /api/gpu/acquire — Lease anfordern (liefert lokales CUDA-Ziel oder Remote-Endpoint)",
+            "step_3": "Bei lokalem Ziel: cuda:{nvidia_index} oder NVIDIA_VISIBLE_DEVICES nutzen",
+            "step_4": "Bei Remote-Ziel: remote_ollama_url / remote_agent_url nutzen",
+            "step_5": "POST /api/gpu/release — Lease freigeben wenn fertig",
+            "note": "NVIDIA_VISIBLE_DEVICES ist ein Startzeit-Mechanismus. Fuer Laufzeit-Switching: Lease-basiertes Device-Mapping ueber nvidia_index verwenden. Remote-GPUs werden nur genutzt wenn sie online sind."
         },
         "endpoints": {
             "status": {
@@ -1634,17 +1736,18 @@ pub async fn get_discover(State(state): State<Arc<AppState>>) -> impl IntoRespon
                 "path": "/api/gpu/acquire",
                 "description": "GPU-Lease anfordern (VRAM reservieren)",
                 "body": {"pipeline": "string", "workload_type": "string", "vram_mb": 4000, "duration_seconds": 3600},
-                "returns": {"granted": true, "gpu_device": "PCI", "gpu_uuid": "GPU-xxx", "lease_id": "uuid"}
+                "returns": {"granted": true, "gpu_device": "PCI oder remote://name", "gpu_uuid": "GPU-xxx oder leer", "nvidia_index": 1, "remote_ollama_url": "http://host:11434", "lease_id": "uuid"}
             },
             "gpu_release": {
                 "method": "POST",
                 "path": "/api/gpu/release",
-                "body": {"lease_id": "uuid"}
+                "body": {"lease_id": "uuid", "actual_vram_mb": 3500, "actual_duration_seconds": 42, "success": true}
             },
             "gpu_recommend": {
                 "method": "GET",
                 "path": "/api/gpu/recommend",
-                "description": "Empfohlene GPU basierend auf Last und Warning Level"
+                "description": "Empfohlene GPU basierend auf Last, Warnstufe und optionalem Workload",
+                "query": {"pipeline": "optional", "workload_type": "optional", "vram_mb": "optional"}
             },
             "llm_chat": {
                 "method": "POST",
@@ -1677,7 +1780,7 @@ pub async fn get_discover(State(state): State<Arc<AppState>>) -> impl IntoRespon
             }
         },
         "integration": {
-            "python_client": "pip install egpu-llm-client (oder clients/python/egpu_llm_client.py kopieren)",
+            "python_client": "pip install egpu-llm-client (oder clients/python/egpu_manager_client.py / egpu_llm_client.py kopieren)",
             "docker_compose": {
                 "extra_hosts": "host.docker.internal:host-gateway",
                 "environment": format!("EGPU_MANAGER_URL=http://host.docker.internal:{port}"),
@@ -1688,7 +1791,8 @@ pub async fn get_discover(State(state): State<Arc<AppState>>) -> impl IntoRespon
                     "host": format!("http://localhost:{port}"),
                     "docker": format!("http://host.docker.internal:{port}")
                 },
-                "CUDA_DEVICE": "nvidia_index aus /api/gpu/acquire (z.B. cuda:1 fuer eGPU)"
+                "CUDA_DEVICE": "nvidia_index aus /api/gpu/acquire (z.B. cuda:1 fuer eGPU)",
+                "REMOTE_OLLAMA_URL": "nur gesetzt falls /api/gpu/acquire ein Remote-Ziel liefert"
             }
         }
     }))

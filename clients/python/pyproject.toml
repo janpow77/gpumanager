@@ -5,7 +5,7 @@ build-backend = "setuptools.backends._legacy:_Backend"
 [project]
 name = "egpu-llm-client"
 version = "0.1.0"
-description = "Python client for eGPU Manager LLM Gateway"
+description = "Python clients for the eGPU Manager local API and LLM Gateway"
 requires-python = ">=3.10"
 dependencies = ["requests>=2.28"]
 

@@ -873,13 +873,25 @@ window._tbReconnect=function(){showConfirm("Thunderbolt-Reconnect?","eGPU wird k
 // ─── Setup Download ─────────────────────────────────────
 window._downloadSetup=function(){
   showConfirm("Windows-Setup generieren?",
-    "Es wird ein ZIP-Paket mit Installationsskripten fuer den Windows-11-Remote-Node erstellt. Das ZIP auf einen USB-Stick kopieren und am Windows-Rechner entpacken.",
+    "Es wird ein ZIP-Paket mit Installationsskripten fuer den Windows-11-Remote-Node erstellt. Danach das ZIP lokal auf den Windows-Rechner kopieren und dort entpacken.",
     function(){
+      var defaultHost=(window.location&&window.location.hostname)?window.location.hostname:"192.168.1.100";
+      var nucHost=window.prompt("NUC-IP oder Hostname fuer den Windows-Rechner:",defaultHost);
+      if(!nucHost)return;
+      nucHost=nucHost.trim();
+      if(!nucHost)return;
+      var suggestedName="remote-"+defaultHost.replace(/[^a-zA-Z0-9_-]+/g,"-");
+      var remoteName=window.prompt("Name des Remote-Knotens im Dashboard:",suggestedName);
+      if(!remoteName)return;
+      remoteName=remoteName.trim();
+      if(!remoteName)return;
       var a=document.createElement("a");
-      a.href=BASE+"/api/setup/generate";
-      a.download="egpu-remote-setup.zip";
-      // Use fetch+POST to trigger generation, then download
-      fetch(BASE+"/api/setup/generate",{method:"POST"})
+      a.download="egpu-remote-setup-"+remoteName.replace(/[^a-zA-Z0-9_-]+/g,"-")+".zip";
+      fetch(BASE+"/api/setup/generate",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({nuc_host:nucHost,remote_name:remoteName})
+      })
         .then(function(r){
           if(!r.ok) throw new Error("Generierung fehlgeschlagen");
           return r.blob();
@@ -891,6 +903,7 @@ window._downloadSetup=function(){
           a.click();
           document.body.removeChild(a);
           URL.revokeObjectURL(url);
+          alert("Installer erzeugt.\n\nNaechste Schritte:\n1. ZIP auf den Windows-Rechner kopieren\n2. Nach C:\\egpu-remote\\setup entpacken\n3. install.ps1 als Administrator starten");
         })
         .catch(function(e){alert("Fehler: "+e.message)});
     }

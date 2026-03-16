@@ -7,10 +7,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::Router;
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post, put};
-use axum::Router;
 use egpu_manager_common::config::Config;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -53,20 +53,13 @@ fn build_router(state: Arc<AppState>) -> Router {
                 Method::DELETE,
                 Method::OPTIONS,
             ])
-            .allow_headers([
-                header::CONTENT_TYPE,
-                header::ACCEPT,
-                header::AUTHORIZATION,
-            ]);
+            .allow_headers([header::CONTENT_TYPE, header::ACCEPT, header::AUTHORIZATION]);
 
         if cfg.local_api.cors_origins.is_empty() {
             // Kein offener Zugriff: nur localhost als Standard erlauben
-            let default_origin: HeaderValue = format!(
-                "http://localhost:{}",
-                cfg.local_api.port
-            )
-            .parse()
-            .unwrap_or_else(|_| "http://localhost:7842".parse().unwrap());
+            let default_origin: HeaderValue = format!("http://localhost:{}", cfg.local_api.port)
+                .parse()
+                .unwrap_or_else(|_| "http://localhost:7842".parse().unwrap());
             cors = cors.allow_origin(vec![default_origin]);
         } else {
             let origins: Vec<HeaderValue> = cfg
@@ -134,7 +127,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/setup/generate", post(api::post_setup_generate))
         .route("/api/setup/instructions", get(api::get_setup_instructions))
         // LLM Gateway
-        .route("/api/llm/chat/completions", post(api::post_llm_chat_completions))
+        .route(
+            "/api/llm/chat/completions",
+            post(api::post_llm_chat_completions),
+        )
         .route("/api/llm/providers", get(api::get_llm_providers))
         .route("/api/llm/usage/{app_id}", get(api::get_llm_usage))
         .route("/api/llm/health", get(api::get_llm_health))
@@ -163,21 +159,19 @@ pub async fn start_web_server(
         .as_ref()
         .filter(|gw| gw.enabled)
         .map(|gw| {
-            let secrets = crate::llm::router::LlmSecrets::load(
-                "/etc/egpu-manager/llm-secrets.toml",
-            );
+            let secrets =
+                crate::llm::router::LlmSecrets::load("/etc/egpu-manager/llm-secrets.toml");
             Arc::new(crate::llm::router::LlmRouter::new(gw.clone(), &secrets))
         });
 
     // Bind-Adresse und Port vor dem ArcSwap-Move auslesen
-    let bind_addr: std::net::IpAddr = config
-        .local_api
-        .bind_address
-        .parse()
-        .unwrap_or_else(|_| {
-            warn!("Ungueltige bind_address '{}', verwende 0.0.0.0", config.local_api.bind_address);
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
-        });
+    let bind_addr: std::net::IpAddr = config.local_api.bind_address.parse().unwrap_or_else(|_| {
+        warn!(
+            "Ungueltige bind_address '{}', verwende 0.0.0.0",
+            config.local_api.bind_address
+        );
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
+    });
     let port = config.local_api.port;
 
     let state = Arc::new(AppState {
@@ -214,10 +208,12 @@ pub async fn start_web_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::RegisteredRemoteGpu;
     use crate::scheduler::{GpuCapacity, VramScheduler};
     use crate::warning::WarningStateMachine;
     use axum::body::Body;
     use axum::http::Request;
+    use chrono::Utc;
     use std::collections::HashMap;
     use tower::ServiceExt;
 
@@ -243,9 +239,8 @@ mod tests {
             },
             90,
         );
-        let health_score = crate::health_score::LinkHealthScore::new(
-            3.0, 5.0, 2.0, 5.0, 1.0, 60.0, 40.0,
-        );
+        let health_score =
+            crate::health_score::LinkHealthScore::new(3.0, 5.0, 2.0, 5.0, 1.0, 60.0, 40.0);
         let monitor_state = Arc::new(Mutex::new(MonitorState {
             warning_machine,
             scheduler,
@@ -256,6 +251,84 @@ mod tests {
             active_leases: HashMap::new(),
             recovery_active: false,
             remote_gpus: Vec::new(),
+        }));
+
+        Arc::new(AppState {
+            config: ArcSwap::from_pointee(config),
+            db,
+            monitor_state,
+            sse: SseBroadcaster::new(64),
+            started_at: Instant::now(),
+            llm_router: None,
+        })
+    }
+
+    fn make_remote_test_state(remote_status: &str) -> Arc<AppState> {
+        let config_str = r#"
+            schema_version = 1
+            [gpu]
+            egpu_pci_address = "0000:05:00.0"
+            internal_pci_address = "0000:02:00.0"
+
+            [[pipeline]]
+            project = "demo"
+            container = "worker"
+            compose_file = "/tmp/demo-compose.yml"
+            compose_service = "worker"
+            workload_types = ["embeddings"]
+            gpu_priority = 2
+            gpu_device = "0000:05:00.0"
+            cuda_fallback_device = "0000:02:00.0"
+            vram_estimate_mb = 4096
+            remote_capable = ["embeddings"]
+            cuda_only = []
+
+            [[remote_gpu]]
+            name = "lan-rtx"
+            host = "192.168.1.50"
+            port_ollama = 11434
+            port_egpu_agent = 7843
+            gpu_name = "RTX Remote"
+            vram_mb = 16384
+            auto_assign = true
+        "#;
+        let config: Config = toml::from_str(config_str).unwrap();
+
+        let db = EventDb::open_in_memory().unwrap();
+        let warning_machine = WarningStateMachine::new(120);
+        let scheduler = VramScheduler::new(
+            GpuCapacity {
+                total_vram_mb: 16000,
+                display_reserve_mb: 0,
+            },
+            GpuCapacity {
+                total_vram_mb: 8000,
+                display_reserve_mb: 512,
+            },
+            90,
+        );
+        let health_score =
+            crate::health_score::LinkHealthScore::new(3.0, 5.0, 2.0, 5.0, 1.0, 60.0, 40.0);
+        let monitor_state = Arc::new(Mutex::new(MonitorState {
+            warning_machine,
+            scheduler,
+            health_score,
+            gpu_status: Vec::new(),
+            pcie_throughput: HashMap::new(),
+            ollama_models: Vec::new(),
+            active_leases: HashMap::new(),
+            recovery_active: false,
+            remote_gpus: vec![RegisteredRemoteGpu {
+                name: "lan-rtx".to_string(),
+                host: "192.168.1.50".to_string(),
+                port_ollama: 11434,
+                port_agent: 7843,
+                gpu_name: "RTX Remote".to_string(),
+                vram_mb: 16384,
+                status: remote_status.to_string(),
+                last_heartbeat: Utc::now(),
+                latency_ms: Some(4),
+            }],
         }));
 
         Arc::new(AppState {
@@ -524,5 +597,110 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.get("recommended_gpu").is_some());
         assert!(json.get("warning_level").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_gpu_acquire_reserves_local_vram_for_following_leases() {
+        let state = make_test_state();
+        let app = build_router(Arc::clone(&state));
+
+        let first = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/gpu/acquire")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"pipeline":"first","workload_type":"ocr","vram_mb":15000}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = axum::body::to_bytes(first.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["granted"], true);
+        assert_eq!(first_json["gpu_device"], "0000:05:00.0");
+
+        let app2 = build_router(state);
+        let second = app2
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/gpu/acquire")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"pipeline":"second","workload_type":"ocr","vram_mb":2000}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = axum::body::to_bytes(second.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        assert_eq!(second_json["granted"], true);
+        assert_eq!(second_json["gpu_device"], "0000:02:00.0");
+    }
+
+    #[tokio::test]
+    async fn test_gpu_acquire_uses_online_remote_gpu_for_remote_capable_workload() {
+        let state = make_remote_test_state("online");
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/gpu/acquire")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"pipeline":"worker","workload_type":"embeddings","vram_mb":15500}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["granted"], true);
+        assert_eq!(json["target_kind"], "remote");
+        assert_eq!(json["remote_gpu_name"], "lan-rtx");
+        assert_eq!(json["remote_host"], "192.168.1.50");
+    }
+
+    #[tokio::test]
+    async fn test_gpu_recommend_ignores_offline_remote_gpu() {
+        let state = make_remote_test_state("offline");
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/api/gpu/recommend?pipeline=worker&workload_type=embeddings&vram_mb=15500",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["recommended_gpu"], "egpu");
+        assert_eq!(json["remote_gpu_name"], serde_json::Value::Null);
     }
 }

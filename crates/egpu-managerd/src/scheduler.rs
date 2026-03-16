@@ -52,6 +52,13 @@ pub struct PipelineAssignment {
     pub preferred_target: GpuTarget,
 }
 
+/// A temporary VRAM reservation for an external GPU lease.
+#[derive(Debug, Clone)]
+pub struct LeaseReservation {
+    pub target: GpuTarget,
+    pub vram_mb: u64,
+}
+
 /// A request to schedule a pipeline.
 #[derive(Debug, Clone)]
 pub struct ScheduleRequest {
@@ -100,6 +107,8 @@ pub struct VramScheduler {
     internal_capacity: GpuCapacity,
     /// Currently assigned pipelines, keyed by name.
     assignments: HashMap<String, PipelineAssignment>,
+    /// Temporary lease-based reservations for external applications.
+    lease_reservations: HashMap<String, LeaseReservation>,
     /// Queue of pending requests that could not be assigned.
     queue: VecDeque<ScheduleRequest>,
     /// Current warning level (affects eGPU scheduling).
@@ -124,6 +133,7 @@ impl VramScheduler {
             egpu_capacity,
             internal_capacity,
             assignments: HashMap::new(),
+            lease_reservations: HashMap::new(),
             queue: VecDeque::new(),
             warning_level: WarningLevel::Green,
             compute_threshold_percent,
@@ -153,6 +163,16 @@ impl VramScheduler {
     pub fn set_admission_state(&mut self, state: AdmissionState) {
         info!("eGPU-Admission geaendert: {}", state);
         self.admission_state = state;
+    }
+
+    /// Whether the physical eGPU is currently available.
+    pub fn egpu_available(&self) -> bool {
+        self.egpu_available
+    }
+
+    /// Whether a new workload of the given priority may be placed on the eGPU.
+    pub fn egpu_allows_priority(&self, priority: u32) -> bool {
+        self.egpu_available && !self.is_egpu_blocked_for_priority(priority)
     }
 
     /// Get the current eGPU admission state.
@@ -195,6 +215,26 @@ impl VramScheduler {
         &mut self.assignments
     }
 
+    /// Add a temporary VRAM reservation for an externally managed GPU lease.
+    pub fn reserve_lease(&mut self, lease_id: String, target: GpuTarget, vram_mb: u64) {
+        self.lease_reservations
+            .insert(lease_id, LeaseReservation { target, vram_mb });
+    }
+
+    /// Remove a temporary VRAM reservation for an external GPU lease.
+    pub fn release_lease(&mut self, lease_id: &str) -> Option<LeaseReservation> {
+        self.lease_reservations.remove(lease_id)
+    }
+
+    /// Total VRAM reserved by active leases on a GPU.
+    pub fn reserved_vram(&self, target: GpuTarget) -> u64 {
+        self.lease_reservations
+            .values()
+            .filter(|r| r.target == target)
+            .map(|r| r.vram_mb)
+            .sum()
+    }
+
     /// Get pipelines assigned to a specific GPU, sorted by priority (highest first).
     pub fn pipelines_on_gpu(&self, target: GpuTarget) -> Vec<&PipelineAssignment> {
         let mut result: Vec<_> = self
@@ -208,7 +248,8 @@ impl VramScheduler {
 
     /// Total VRAM used on a GPU.
     pub fn vram_used(&self, target: GpuTarget) -> u64 {
-        self.assignments
+        let assigned_vram: u64 = self
+            .assignments
             .values()
             .filter(|a| a.target == target)
             .map(|a| {
@@ -218,7 +259,9 @@ impl VramScheduler {
                     a.vram_estimate_mb
                 }
             })
-            .sum()
+            .sum();
+
+        assigned_vram + self.reserved_vram(target)
     }
 
     /// Available VRAM on a GPU.
@@ -227,7 +270,9 @@ impl VramScheduler {
             GpuTarget::Egpu => &self.egpu_capacity,
             GpuTarget::Internal => &self.internal_capacity,
         };
-        capacity.available_vram_mb().saturating_sub(self.vram_used(target))
+        capacity
+            .available_vram_mb()
+            .saturating_sub(self.vram_used(target))
     }
 
     /// Schedule a pipeline for GPU assignment.
@@ -235,9 +280,7 @@ impl VramScheduler {
         // If already assigned, skip
         if self.assignments.contains_key(&request.name) {
             debug!("Pipeline {} ist bereits zugewiesen", request.name);
-            return ScheduleResult::Assigned(
-                self.assignments[&request.name].target,
-            );
+            return ScheduleResult::Assigned(self.assignments[&request.name].target);
         }
 
         let target = self.resolve_target(&request);
@@ -276,13 +319,63 @@ impl VramScheduler {
 
     /// Migrate a pipeline to a different GPU.
     pub fn migrate(&mut self, name: &str, new_target: GpuTarget) -> bool {
+        let Some(current) = self.assignments.get(name).cloned() else {
+            return false;
+        };
+
+        if current.target == new_target {
+            return true;
+        }
+
+        if new_target == GpuTarget::Egpu && self.is_egpu_blocked_for_priority(current.priority) {
+            warn!(
+                "Migration von {} nach {} abgelehnt: eGPU blockiert",
+                name, new_target
+            );
+            return false;
+        }
+
+        let current_vram = if current.actual_vram_mb > 0 {
+            current.actual_vram_mb
+        } else {
+            current.vram_estimate_mb
+        };
+
+        let target_capacity = match new_target {
+            GpuTarget::Egpu => &self.egpu_capacity,
+            GpuTarget::Internal => &self.internal_capacity,
+        };
+
+        let target_used_without_current: u64 = self
+            .assignments
+            .values()
+            .filter(|a| a.target == new_target && a.name != name)
+            .map(|a| {
+                if a.actual_vram_mb > 0 {
+                    a.actual_vram_mb
+                } else {
+                    a.vram_estimate_mb
+                }
+            })
+            .sum::<u64>()
+            + self.reserved_vram(new_target);
+
+        let available = target_capacity
+            .available_vram_mb()
+            .saturating_sub(target_used_without_current);
+
+        if available < current_vram {
+            warn!(
+                "Migration von {} nach {} abgelehnt: nicht genug VRAM ({} MB frei, {} MB benoetigt)",
+                name, new_target, available, current_vram
+            );
+            return false;
+        }
+
         if let Some(assignment) = self.assignments.get_mut(name) {
             let old = assignment.target;
             assignment.target = new_target;
-            info!(
-                "Pipeline {} migriert: {} -> {}",
-                name, old, new_target
-            );
+            info!("Pipeline {} migriert: {} -> {}", name, old, new_target);
             true
         } else {
             false
@@ -311,10 +404,7 @@ impl VramScheduler {
             );
             true
         } else {
-            warn!(
-                "Workload-Update für unbekannte Pipeline: {}",
-                pipeline
-            );
+            warn!("Workload-Update für unbekannte Pipeline: {}", pipeline);
             false
         }
     }
@@ -338,10 +428,7 @@ impl VramScheduler {
             WarningLevel::Green => false,
             WarningLevel::Yellow => {
                 if priority >= 4 {
-                    debug!(
-                        "eGPU blockiert: Warnstufe YELLOW, Prio {} >= 4",
-                        priority
-                    );
+                    debug!("eGPU blockiert: Warnstufe YELLOW, Prio {} >= 4", priority);
                     true
                 } else {
                     false
@@ -501,10 +588,7 @@ impl VramScheduler {
             }
 
             self.assign(request, target);
-            Some(ScheduleResult::PreemptedAndAssigned {
-                target,
-                preempted,
-            })
+            Some(ScheduleResult::PreemptedAndAssigned { target, preempted })
         } else {
             None
         }
@@ -843,10 +927,7 @@ mod tests {
         });
 
         assert!(sched.migrate("worker", GpuTarget::Internal));
-        assert_eq!(
-            sched.assignments()["worker"].target,
-            GpuTarget::Internal
-        );
+        assert_eq!(sched.assignments()["worker"].target, GpuTarget::Internal);
     }
 
     #[test]
