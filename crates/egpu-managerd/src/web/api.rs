@@ -182,6 +182,7 @@ pub struct RemoteGpuInfo {
 }
 
 pub async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = state.config.load();
     let monitor_state = state.monitor_state.lock().await;
     let uptime = state.started_at.elapsed().as_secs();
 
@@ -203,7 +204,7 @@ pub async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
         recovery_active,
         recovery_stage,
         mode: "normal".to_string(),
-        config_schema_version: state.config.schema_version,
+        config_schema_version: cfg.schema_version,
     };
 
     // Gap 5: Build GPU info from MonitorState.gpu_status (populated by GPU poller)
@@ -211,9 +212,9 @@ pub async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
         .gpu_status
         .iter()
         .map(|g| {
-            let gpu_type = if g.pci_address == state.config.gpu.egpu_pci_address {
+            let gpu_type = if g.pci_address == cfg.gpu.egpu_pci_address {
                 "egpu"
-            } else if g.pci_address == state.config.gpu.internal_pci_address {
+            } else if g.pci_address == cfg.gpu.internal_pci_address {
                 "internal"
             } else {
                 "unknown"
@@ -276,7 +277,7 @@ pub async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
         });
     }
 
-    for r in &state.config.remote_gpu {
+    for r in &cfg.remote_gpu {
         if !registered_names.contains(&r.name) {
             remote_gpus.push(RemoteGpuInfo {
                 name: r.name.clone(),
@@ -338,10 +339,11 @@ pub struct VramSummary {
 }
 
 pub async fn get_pipelines(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let config = state.config.load();
     let monitor_state = state.monitor_state.lock().await;
     let mut pipelines = Vec::new();
 
-    for cfg in &state.config.pipeline {
+    for cfg in &config.pipeline {
         let (gpu_type, status, actual_vram, decision_reason, assignment_source) =
             if let Some(assignment) = monitor_state.scheduler.assignments().get(&cfg.container) {
                 let gpu_type = match assignment.target {
@@ -373,7 +375,7 @@ pub async fn get_pipelines(State(state): State<Arc<AppState>>) -> impl IntoRespo
         let warning_level = monitor_state.warning_machine.current_level();
         let blocked_by =
             if warning_level >= egpu_manager_common::gpu::WarningLevel::Yellow
-                && cfg.gpu_device == state.config.gpu.egpu_pci_address
+                && cfg.gpu_device == config.gpu.egpu_pci_address
             {
                 Some(format!("warning_level:{warning_level}"))
             } else {
@@ -410,8 +412,8 @@ pub async fn get_pipeline(
     State(state): State<Arc<AppState>>,
     Path(container): Path<String>,
 ) -> impl IntoResponse {
-    let pipeline_cfg = state
-        .config
+    let config = state.config.load();
+    let pipeline_cfg = config
         .pipeline
         .iter()
         .find(|p| p.container == container);
@@ -453,7 +455,7 @@ pub async fn get_pipeline(
     let warning_level = monitor_state.warning_machine.current_level();
     let blocked_by =
         if warning_level >= egpu_manager_common::gpu::WarningLevel::Yellow
-            && cfg.gpu_device == state.config.gpu.egpu_pci_address
+            && cfg.gpu_device == config.gpu.egpu_pci_address
         {
             Some(format!("warning_level:{warning_level}"))
         } else {
@@ -570,9 +572,10 @@ pub async fn post_pipeline_assign(
     Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<AssignBody>,
 ) -> impl IntoResponse {
-    let target = if body.gpu_device == state.config.gpu.egpu_pci_address {
+    let config = state.config.load();
+    let target = if body.gpu_device == config.gpu.egpu_pci_address {
         GpuTarget::Egpu
-    } else if body.gpu_device == state.config.gpu.internal_pci_address {
+    } else if body.gpu_device == config.gpu.internal_pci_address {
         GpuTarget::Internal
     } else {
         return api_error(
@@ -669,9 +672,10 @@ pub async fn post_gpu_acquire(
     State(state): State<Arc<AppState>>,
     Json(body): Json<GpuAcquireBody>,
 ) -> impl IntoResponse {
+    let config = state.config.load();
     let result = acquire_gpu_lease(
         &state.monitor_state,
-        &state.config,
+        &config,
         body.pipeline.clone(),
         body.workload_type.clone(),
         body.vram_mb,
@@ -775,6 +779,7 @@ pub async fn post_gpu_release(
 // ─── GET /api/gpu/recommend (Gap 4) ──────────────────────────────────────
 
 pub async fn get_gpu_recommend(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = state.config.load();
     let monitor_state = state.monitor_state.lock().await;
 
     let warning_level = monitor_state.warning_machine.current_level();
@@ -790,14 +795,13 @@ pub async fn get_gpu_recommend(State(state): State<Arc<AppState>>) -> impl IntoR
     };
 
     let recommended_device = if recommended == "egpu" {
-        &state.config.gpu.egpu_pci_address
+        &cfg.gpu.egpu_pci_address
     } else {
-        &state.config.gpu.internal_pci_address
+        &cfg.gpu.internal_pci_address
     };
 
     // Get Ollama host if configured
-    let ollama_host = state
-        .config
+    let ollama_host = cfg
         .ollama
         .as_ref()
         .filter(|o| o.enabled)
@@ -821,7 +825,8 @@ pub async fn post_egpu_admission(
     headers: axum::http::HeaderMap,
     Json(body): Json<AdmissionBody>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_bearer_auth(&headers, &state.config) {
+    let cfg = state.config.load();
+    if let Err(resp) = check_bearer_auth(&headers, &cfg) {
         return resp.into_response();
     }
     let new_state = match body.action.as_str() {
@@ -884,7 +889,8 @@ pub async fn post_egpu_admission(
 // ─── GET /api/ollama/status ──────────────────────────────────────────────
 
 pub async fn get_ollama_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let Some(ref ollama_cfg) = state.config.ollama else {
+    let cfg = state.config.load();
+    let Some(ref ollama_cfg) = cfg.ollama else {
         return api_error(StatusCode::NOT_FOUND, "Ollama nicht konfiguriert").into_response();
     };
 
@@ -939,10 +945,11 @@ pub async fn post_ollama_unload(
     Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<UnloadModelBody>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_bearer_auth(&headers, &state.config) {
+    let cfg = state.config.load();
+    if let Err(resp) = check_bearer_auth(&headers, &cfg) {
         return resp.into_response();
     }
-    let Some(ref ollama_cfg) = state.config.ollama else {
+    let Some(ref ollama_cfg) = cfg.ollama else {
         return api_error(StatusCode::NOT_FOUND, "Ollama nicht konfiguriert").into_response();
     };
 
@@ -1045,14 +1052,15 @@ pub async fn post_recovery_reset(
     Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<ConfirmBody>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_bearer_auth(&headers, &state.config) {
+    let cfg = state.config.load();
+    if let Err(resp) = check_bearer_auth(&headers, &cfg) {
         return resp.into_response();
     }
     if is_dry_run(&dry_run) {
         return Json(DryRunResponse {
             dry_run: true,
             impact: "PCIe-FLR-Reset wuerde ausgefuehrt".to_string(),
-            would_affect: vec![state.config.gpu.egpu_pci_address.clone()],
+            would_affect: vec![cfg.gpu.egpu_pci_address.clone()],
         })
         .into_response();
     }
@@ -1099,7 +1107,8 @@ pub async fn post_thunderbolt_reconnect(
     Query(dry_run): Query<DryRunQuery>,
     Json(body): Json<ConfirmBody>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_bearer_auth(&headers, &state.config) {
+    let cfg = state.config.load();
+    if let Err(resp) = check_bearer_auth(&headers, &cfg) {
         return resp.into_response();
     }
     if is_dry_run(&dry_run) {
@@ -1226,7 +1235,8 @@ pub async fn get_audit_log(
 
 pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Return config without secrets (token paths, etc.)
-    let mut config_json = serde_json::to_value(&*state.config).unwrap_or_default();
+    let cfg = state.config.load();
+    let mut config_json = serde_json::to_value(&**cfg).unwrap_or_default();
 
     // Redact sensitive fields
     if let Some(remote) = config_json.get_mut("remote")
@@ -1256,9 +1266,11 @@ pub async fn post_config_reload(
     headers: axum::http::HeaderMap,
     Query(dry_run): Query<DryRunQuery>,
 ) -> impl IntoResponse {
-    if let Err(resp) = check_bearer_auth(&headers, &state.config) {
+    let cfg = state.config.load();
+    if let Err(resp) = check_bearer_auth(&headers, &cfg) {
         return resp.into_response();
     }
+    drop(cfg); // Guard vor dem Swap freigeben
     if is_dry_run(&dry_run) {
         return Json(DryRunResponse {
             dry_run: true,
@@ -1284,15 +1296,19 @@ pub async fn post_config_reload(
         serde_json::json!({"action": "reload_requested"}),
     ));
 
-    // Konfigurations-Datei laden und validieren
+    // Konfigurations-Datei laden, validieren und hot-swappen
     let config_path = std::path::Path::new("/etc/egpu-manager/config.toml");
     match egpu_manager_common::config::Config::load(config_path) {
-        Ok(_new_config) => {
-            // Validierung erfolgreich. Hot-Swap braeuchte ArcSwap, hier nur Validierung.
+        Ok(new_config) => {
+            // Neue Konfiguration atomar in den ArcSwap schreiben —
+            // alle nachfolgenden Handler-Aufrufe sehen sofort die neue Config.
+            state.config.store(Arc::new(new_config));
+
+            tracing::info!("Konfiguration hot-reloaded via API");
+
             Json(serde_json::json!({
                 "ok": true,
-                "message": "Konfiguration geladen und validiert",
-                "note": "Hot-Reload wird im naechsten Monitoring-Zyklus angewendet"
+                "message": "Konfiguration geladen, validiert und hot-reloaded",
             }))
             .into_response()
         }

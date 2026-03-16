@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post, put};
@@ -22,7 +23,7 @@ use crate::web::sse::SseBroadcaster;
 
 /// Shared application state for all Axum handlers.
 pub struct AppState {
-    pub config: Arc<Config>,
+    pub config: ArcSwap<Config>,
     pub db: EventDb,
     pub monitor_state: Arc<Mutex<MonitorState>>,
     pub sse: SseBroadcaster,
@@ -43,6 +44,7 @@ async fn serve_index() -> impl IntoResponse {
 fn build_router(state: Arc<AppState>) -> Router {
     // CORS configuration from config
     let cors = {
+        let cfg = state.config.load();
         let mut cors = CorsLayer::new()
             .allow_methods([
                 Method::GET,
@@ -57,18 +59,17 @@ fn build_router(state: Arc<AppState>) -> Router {
                 header::AUTHORIZATION,
             ]);
 
-        if state.config.local_api.cors_origins.is_empty() {
+        if cfg.local_api.cors_origins.is_empty() {
             // Kein offener Zugriff: nur localhost als Standard erlauben
             let default_origin: HeaderValue = format!(
                 "http://localhost:{}",
-                state.config.local_api.port
+                cfg.local_api.port
             )
             .parse()
             .unwrap_or_else(|_| "http://localhost:7842".parse().unwrap());
             cors = cors.allow_origin(vec![default_origin]);
         } else {
-            let origins: Vec<HeaderValue> = state
-                .config
+            let origins: Vec<HeaderValue> = cfg
                 .local_api
                 .cors_origins
                 .iter()
@@ -164,8 +165,19 @@ pub async fn start_web_server(
             Arc::new(crate::llm::router::LlmRouter::new(gw.clone(), &secrets))
         });
 
+    // Bind-Adresse und Port vor dem ArcSwap-Move auslesen
+    let bind_addr: std::net::IpAddr = config
+        .local_api
+        .bind_address
+        .parse()
+        .unwrap_or_else(|_| {
+            warn!("Ungueltige bind_address '{}', verwende 0.0.0.0", config.local_api.bind_address);
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
+        });
+    let port = config.local_api.port;
+
     let state = Arc::new(AppState {
-        config: Arc::clone(&config),
+        config: ArcSwap::new(config),
         db,
         monitor_state,
         sse,
@@ -175,15 +187,7 @@ pub async fn start_web_server(
 
     let router = build_router(state);
 
-    let bind_addr: std::net::IpAddr = config
-        .local_api
-        .bind_address
-        .parse()
-        .unwrap_or_else(|_| {
-            warn!("Ungueltige bind_address '{}', verwende 0.0.0.0", config.local_api.bind_address);
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))
-        });
-    let addr = SocketAddr::from((bind_addr, config.local_api.port));
+    let addr = SocketAddr::from((bind_addr, port));
     info!("Web-Server startet auf http://{addr}");
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -251,7 +255,7 @@ mod tests {
         }));
 
         Arc::new(AppState {
-            config: Arc::new(config),
+            config: ArcSwap::from_pointee(config),
             db,
             monitor_state,
             sse: SseBroadcaster::new(64),
