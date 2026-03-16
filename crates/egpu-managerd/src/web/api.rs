@@ -1440,6 +1440,8 @@ pub async fn get_llm_usage(
     };
 
     let summary = router.usage_for_app(&app_id).await;
+    // FIX 16: DB-gestuetzte Nutzungsdaten koennten hier ergaenzend aus
+    // state.db.query_monthly_usage(&app_id) geladen werden.
     Json(serde_json::to_value(summary).unwrap()).into_response()
 }
 

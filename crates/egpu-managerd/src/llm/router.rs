@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use egpu_manager_common::config::{AppRoutingConfig, LlmGatewayConfig, LlmProviderConfig};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use super::budget::BudgetTracker;
@@ -85,6 +85,8 @@ pub struct LlmRouter {
     app_routing: HashMap<String, AppRoutingConfig>,
     rate_limiter: Mutex<RateLimiter>,
     pub budget: Arc<Mutex<BudgetTracker>>,
+    /// FIX 17: Gecachtes Health-Check-Ergebnis (Zeitpunkt, Ergebnisse)
+    last_health_check: RwLock<(Instant, Vec<ProviderStatus>)>,
 }
 
 impl LlmRouter {
@@ -138,6 +140,7 @@ impl LlmRouter {
             app_routing,
             rate_limiter: Mutex::new(RateLimiter::new()),
             budget: Arc::new(Mutex::new(BudgetTracker::new())),
+            last_health_check: RwLock::new((Instant::now() - std::time::Duration::from_secs(120), Vec::new())),
         }
     }
 
@@ -305,13 +308,26 @@ impl LlmRouter {
     }
 
     /// Get provider status list.
+    /// FIX 17: Health-Check-Ergebnisse werden 60 Sekunden gecacht.
     pub async fn provider_status(&self) -> Vec<ProviderStatus> {
+        let health_cache_duration = std::time::Duration::from_secs(60);
+
+        // Pruefen ob Cache noch gueltig ist
+        {
+            let cache = self.last_health_check.read().await;
+            if cache.0.elapsed() < health_cache_duration && !cache.1.is_empty() {
+                return cache.1.clone();
+            }
+        }
+
+        // Cache abgelaufen — Health-Checks ausfuehren
         let budget = self.budget.lock().await;
         let mut statuses = Vec::new();
 
         for provider in &self.providers {
             let cfg = self.find_provider_config(provider.name());
             let (requests, cost) = budget.daily_stats_for_provider(provider.name());
+            let healthy = provider.health_check().await;
 
             statuses.push(ProviderStatus {
                 name: provider.name().to_string(),
@@ -319,11 +335,17 @@ impl LlmRouter {
                     .map(|c| c.provider_type.clone())
                     .unwrap_or_default(),
                 enabled: cfg.map(|c| c.enabled).unwrap_or(true),
-                healthy: true, // lazy health check
+                healthy,
                 models: cfg.map(|c| c.models.clone()).unwrap_or_default(),
                 requests_today: requests,
                 cost_today_usd: cost,
             });
+        }
+
+        // Cache aktualisieren
+        {
+            let mut cache = self.last_health_check.write().await;
+            *cache = (Instant::now(), statuses.clone());
         }
 
         statuses

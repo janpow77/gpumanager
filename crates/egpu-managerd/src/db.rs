@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -76,9 +76,23 @@ pub struct FallbackOverride {
 
 /// Thread-safe database handle wrapping rusqlite (which is not Send).
 /// All operations go through a Mutex-guarded connection.
+/// LLM-Nutzungsdatensatz fuer Budget-Persistierung
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmUsageRecord {
+    pub id: Option<i64>,
+    pub app_id: String,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_usd: f64,
+    pub timestamp: DateTime<Utc>,
+}
+
 #[derive(Clone)]
 pub struct EventDb {
     conn: Arc<Mutex<Connection>>,
+    db_path: Option<PathBuf>,
 }
 
 impl EventDb {
@@ -103,6 +117,7 @@ impl EventDb {
         Self::create_tables(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            db_path: Some(path.to_path_buf()),
         })
     }
 
@@ -113,6 +128,7 @@ impl EventDb {
         Self::create_tables(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            db_path: None,
         })
     }
 
@@ -157,6 +173,19 @@ impl EventDb {
                 max_value     REAL
             );
             CREATE INDEX IF NOT EXISTS idx_agg_bucket ON monitoring_aggregates(bucket_start);
+
+            CREATE TABLE IF NOT EXISTS llm_usage (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_id        TEXT NOT NULL,
+                provider      TEXT NOT NULL,
+                model         TEXT NOT NULL,
+                input_tokens  INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cost_usd      REAL NOT NULL,
+                timestamp     TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_llm_usage_app ON llm_usage(app_id);
+            CREATE INDEX IF NOT EXISTS idx_llm_usage_timestamp ON llm_usage(timestamp);
             ",
         )?;
         Ok(())
@@ -227,6 +256,8 @@ impl EventDb {
         )?;
         if deleted > 0 {
             info!("Retention: {deleted} Events älter als {retention_days} Tage gelöscht");
+            // VACUUM nach Loeschung um Speicherplatz freizugeben
+            let _ = conn.execute_batch("VACUUM;");
         }
         Ok(deleted)
     }
@@ -279,6 +310,8 @@ impl EventDb {
             info!(
                 "Aggregation: {deleted} Monitoring-Events zu 5-Min-Buckets zusammengefasst"
             );
+            // VACUUM nach Aggregation um Speicherplatz freizugeben
+            let _ = conn.execute_batch("VACUUM;");
         }
 
         Ok(deleted)
@@ -399,6 +432,93 @@ impl EventDb {
             "DELETE FROM fallback_overrides WHERE service_name = ?1",
             params![service_name],
         )?;
+        Ok(())
+    }
+
+    /// LLM-Nutzung in die Datenbank schreiben (Budget-Persistierung).
+    pub async fn save_llm_usage(
+        &self,
+        app_id: &str,
+        provider: &str,
+        model: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        cost_usd: f64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO llm_usage (app_id, provider, model, input_tokens, output_tokens, cost_usd, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                app_id,
+                provider,
+                model,
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// LLM-Nutzung des aktuellen Monats fuer eine App abfragen.
+    pub async fn query_monthly_usage(&self, app_id: &str) -> anyhow::Result<Vec<LlmUsageRecord>> {
+        let conn = self.conn.lock().await;
+        let month_start = {
+            let now = Utc::now();
+            now.format("%Y-%m-01T00:00:00+00:00").to_string()
+        };
+
+        let mut stmt = conn.prepare(
+            "SELECT id, app_id, provider, model, input_tokens, output_tokens, cost_usd, timestamp
+             FROM llm_usage WHERE app_id = ?1 AND timestamp >= ?2 ORDER BY timestamp DESC",
+        )?;
+
+        let rows = stmt.query_map(params![app_id, month_start], |row| {
+            let id: i64 = row.get(0)?;
+            let app_id: String = row.get(1)?;
+            let provider: String = row.get(2)?;
+            let model: String = row.get(3)?;
+            let input_tokens: i64 = row.get(4)?;
+            let output_tokens: i64 = row.get(5)?;
+            let cost_usd: f64 = row.get(6)?;
+            let ts_str: String = row.get(7)?;
+
+            Ok(LlmUsageRecord {
+                id: Some(id),
+                app_id,
+                provider,
+                model,
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                timestamp: DateTime::parse_from_rfc3339(&ts_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
+    }
+
+    /// Datenbankgroesse in MB pruefen (fuer max_db_size_mb Monitoring).
+    pub fn check_db_size_mb(&self) -> Option<u64> {
+        self.db_path.as_ref().and_then(|path| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|m| m.len() / (1024 * 1024))
+        })
+    }
+
+    /// VACUUM ausfuehren um Speicherplatz nach Loeschungen freizugeben.
+    pub async fn vacuum(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute_batch("VACUUM;")?;
         Ok(())
     }
 

@@ -206,20 +206,26 @@ impl MonitorOrchestrator {
 
         // Spawn retention/aggregation task
         let db_clone = self.db.clone();
-        let retention_days = self.config.database.retention_days;
-        let aggregate_days = self.config.database.aggregate_after_days;
-        let retention_interval_hours = self.config.database.retention_check_interval_hours;
+        let retention_config = Arc::clone(&self.config);
         let retention_cancel = self.cancel.clone();
         tokio::spawn(async move {
             Self::retention_loop(
                 db_clone,
-                retention_days,
-                aggregate_days,
-                retention_interval_hours,
+                retention_config,
                 retention_cancel,
             )
             .await;
         });
+
+        // FIX 7: Spawn CUDA watchdog task
+        if self.config.gpu.cuda_watchdog_enabled {
+            let watchdog_config = Arc::clone(&self.config);
+            let watchdog_tx = trigger_tx.clone();
+            let watchdog_cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                Self::cuda_watchdog_loop(watchdog_config, watchdog_tx, watchdog_cancel).await;
+            });
+        }
 
         // Spawn step-down check task
         let state_clone = Arc::clone(&self.state);
@@ -419,6 +425,9 @@ impl MonitorOrchestrator {
         let mut last_gpu_activity: Option<std::time::Instant> = None;
         let mut models_loaded = false;
 
+        // FIX 24: Power-Draw-Anomalie-Erkennung
+        let mut power_baseline: Option<f64> = None;
+
         // Proactive monitoring state
         let mut smi_response_times: VecDeque<u128> = VecDeque::with_capacity(
             config.gpu.nvidia_smi_response_avg_window as usize,
@@ -582,6 +591,36 @@ impl MonitorOrchestrator {
                                     let _ = trigger_tx.send(WarningTrigger::ThermalThrottle).await;
                                 }
 
+                                // FIX 24: Power-Draw-Anomalie-Erkennung
+                                let power_w = egpu_status.power_draw_w;
+                                let tdp_w = 250.0_f64; // RTX 5070 Ti TDP
+
+                                // Baseline aktualisieren (gleitender Durchschnitt)
+                                power_baseline = Some(match power_baseline {
+                                    Some(baseline) => baseline * 0.95 + power_w * 0.05,
+                                    None => power_w,
+                                });
+
+                                // Ploetzlicher Abfall auf < 5W bei aktiver GPU (PCIe-Link-Problem)
+                                if power_w < 5.0 && egpu_status.utilization_gpu_percent > 10 {
+                                    warn!(
+                                        "Power-Draw-Anomalie: {:.1}W bei {}% Auslastung — moeglicherweise PCIe-Link-Problem",
+                                        power_w, egpu_status.utilization_gpu_percent
+                                    );
+                                    let mut st = state.lock().await;
+                                    st.health_score.record_event(HealthEventKind::PcieTransient);
+                                }
+
+                                // Dauerhafte Ueberschreitung von TDP * 1.1 (Thermisches Risiko)
+                                if power_w > tdp_w * 1.1 {
+                                    warn!(
+                                        "Power-Draw {:.1}W ueberschreitet TDP*1.1 ({:.1}W) — thermisches Risiko",
+                                        power_w, tdp_w * 1.1
+                                    );
+                                    let mut st = state.lock().await;
+                                    st.health_score.record_event(HealthEventKind::TemperatureSpike);
+                                }
+
                                 // Track GPU activity for idle detection
                                 if egpu_status.utilization_gpu_percent > 0 {
                                     last_gpu_activity = Some(std::time::Instant::now());
@@ -685,6 +724,16 @@ impl MonitorOrchestrator {
                                     gpu.status = egpu_manager_common::gpu::GpuOnlineStatus::Timeout;
                                 }
                             }
+                            drop(st);
+
+                            // FIX 26: Exponentieller Backoff bei aufeinanderfolgenden Fehlern
+                            let backoff_secs = config.gpu.poll_interval_seconds
+                                * (1u64 << consecutive_timeouts.min(5));
+                            debug!(
+                                "nvidia-smi Backoff: {}s (Fehler: {})",
+                                backoff_secs, consecutive_timeouts
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
                         }
                     }
 
@@ -795,6 +844,15 @@ impl MonitorOrchestrator {
         state: Arc<Mutex<MonitorState>>,
         sse: Option<SseBroadcaster>,
     ) -> bool {
+        // FIX 20: Pruefen ob eGPU noch physisch vorhanden ist
+        if !is_egpu_present(&config.gpu.egpu_pci_address) {
+            warn!(
+                "eGPU unter {} nicht erreichbar (Kabel getrennt?) — ueberspringe Druckreduktion",
+                config.gpu.egpu_pci_address
+            );
+            return false;
+        }
+
         info!("Starte Druckreduktion vor Recovery");
 
         if let Some(ref sse) = sse {
@@ -915,6 +973,17 @@ impl MonitorOrchestrator {
         state: Arc<Mutex<MonitorState>>,
         affected_pipelines: Vec<String>,
     ) {
+        // FIX 20: Pruefen ob eGPU noch physisch vorhanden ist vor Recovery
+        if !is_egpu_present(&config.gpu.egpu_pci_address) {
+            warn!(
+                "eGPU unter {} nicht erreichbar (Kabel getrennt?) — ueberspringe Recovery",
+                config.gpu.egpu_pci_address
+            );
+            let mut st = state.lock().await;
+            st.recovery_active = false;
+            return;
+        }
+
         info!(
             "Recovery wird gestartet fuer {} Pipeline(s)",
             affected_pipelines.len()
@@ -972,11 +1041,13 @@ impl MonitorOrchestrator {
 
     async fn retention_loop(
         db: EventDb,
-        retention_days: u32,
-        aggregate_days: u32,
-        interval_hours: u32,
+        config: Arc<Config>,
         cancel: CancellationToken,
     ) {
+        let retention_days = config.database.retention_days;
+        let aggregate_days = config.database.aggregate_after_days;
+        let interval_hours = config.database.retention_check_interval_hours;
+        let max_db_size_mb = config.database.max_db_size_mb;
         let interval = std::time::Duration::from_secs(u64::from(interval_hours) * 3600);
 
         loop {
@@ -991,6 +1062,16 @@ impl MonitorOrchestrator {
                     }
                     if let Err(e) = db.aggregate_monitoring_events(aggregate_days).await {
                         error!("Aggregation fehlgeschlagen: {e}");
+                    }
+
+                    // FIX 19: Datenbankgroesse pruefen
+                    if let Some(size_mb) = db.check_db_size_mb() {
+                        if size_mb > u64::from(max_db_size_mb) {
+                            warn!(
+                                "Datenbankgroesse {}MB ueberschreitet Limit {}MB",
+                                size_mb, max_db_size_mb
+                            );
+                        }
                     }
                 }
             }
@@ -1013,6 +1094,12 @@ impl MonitorOrchestrator {
                     return;
                 }
                 _ = tokio::time::sleep(interval) => {
+                    // FIX 21: sd_notify Watchdog-Ping an systemd
+                    if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
+                        let _ = std::os::unix::net::UnixDatagram::unbound()
+                            .and_then(|s| s.send_to(b"WATCHDOG=1", &socket_path));
+                    }
+
                     let mut state = state.lock().await;
                     if let Some(new_level) = state.warning_machine.try_step_down() {
                         state.scheduler.set_warning_level(new_level);
@@ -1048,6 +1135,81 @@ impl MonitorOrchestrator {
             }
         }
     }
+
+    /// FIX 7: CUDA Watchdog Loop — prueft periodisch ob CUDA-Operationen antworten.
+    async fn cuda_watchdog_loop(
+        config: Arc<Config>,
+        trigger_tx: mpsc::Sender<WarningTrigger>,
+        cancel: CancellationToken,
+    ) {
+        let binary = &config.gpu.cuda_watchdog_binary;
+        let interval_ms = config.gpu.cuda_watchdog_interval_ms;
+        let timeout_ms = config.gpu.cuda_watchdog_timeout_ms;
+
+        // Pruefen ob Binary existiert
+        if !std::path::Path::new(binary).exists() {
+            warn!(
+                "CUDA-Watchdog-Binary '{}' nicht gefunden — Watchdog deaktiviert",
+                binary
+            );
+            return;
+        }
+
+        info!(
+            "CUDA-Watchdog gestartet (Intervall: {}ms, Timeout: {}ms, Binary: {})",
+            interval_ms, timeout_ms, binary
+        );
+
+        let interval = std::time::Duration::from_millis(interval_ms);
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("CUDA-Watchdog beendet");
+                    return;
+                }
+                _ = tokio::time::sleep(interval) => {
+                    let result = tokio::time::timeout(
+                        timeout,
+                        tokio::process::Command::new(binary)
+                            .output(),
+                    )
+                    .await;
+
+                    match result {
+                        Ok(Ok(output)) => {
+                            if !output.status.success() {
+                                warn!(
+                                    "CUDA-Watchdog: Binary '{}' mit Exit-Code {} beendet",
+                                    binary,
+                                    output.status.code().unwrap_or(-1)
+                                );
+                                let _ = trigger_tx.send(WarningTrigger::CudaWatchdogTimeout).await;
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            warn!("CUDA-Watchdog: Fehler beim Ausfuehren von '{}': {}", binary, e);
+                            let _ = trigger_tx.send(WarningTrigger::CudaWatchdogTimeout).await;
+                        }
+                        Err(_) => {
+                            // Timeout
+                            warn!(
+                                "CUDA-Watchdog: Timeout ({}ms) bei '{}'",
+                                timeout_ms, binary
+                            );
+                            let _ = trigger_tx.send(WarningTrigger::CudaWatchdogTimeout).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// FIX 20: Prueft ob die eGPU noch physisch angeschlossen ist (PCI-Vendor-Datei vorhanden).
+fn is_egpu_present(pci_address: &str) -> bool {
+    std::path::Path::new(&format!("/sys/bus/pci/devices/{pci_address}/vendor")).exists()
 }
 
 /// Acquire a GPU lease. Returns the lease on success or a queue position.

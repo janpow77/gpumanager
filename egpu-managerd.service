@@ -10,8 +10,8 @@ Type=simple
 ExecStart=/opt/egpu/egpu-managerd --config /etc/egpu-manager/config.toml
 Restart=on-failure
 RestartSec=10
-# WatchdogSec deaktiviert — Daemon sendet keinen sd_notify WATCHDOG=1
-# WatchdogSec=300
+# Daemon sendet sd_notify WATCHDOG=1 alle 10s im Stepdown-Loop
+WatchdogSec=60
 
 # Graceful shutdown
 TimeoutStopSec=30
