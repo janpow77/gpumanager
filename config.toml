@@ -4,7 +4,7 @@ schema_version = 1
 log_level = "info"
 
 [database]
-db_path = "/tmp/egpu-manager-test/events.db"
+db_path = "/var/lib/egpu-manager/events.db"
 
 [gpu]
 egpu_pci_address = "0000:05:00.0"
@@ -156,6 +156,15 @@ token_path = "/etc/egpu-manager/remote-token.secret"
 [llm_gateway]
 enabled = true
 default_provider = "ollama"
+
+[[llm_gateway.providers]]
+name = "ollama"
+provider_type = "openai_compatible"
+base_url = "http://localhost:11434/v1"
+api_key_ref = ""
+models = ["qwen3:14b", "qwen3:8b", "qwen3:1.7b"]
+enabled = true
+priority = 1
 
 [[remote_gpu]]
 name = "remote-desktop"
