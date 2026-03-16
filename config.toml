@@ -145,6 +145,20 @@ quiesce_hooks = [
   { container = "flowinvoice_redis", command = "redis-cli BGSAVE", timeout_seconds = 5 },
 ]
 
+[[pipeline]]
+project = "love-ai"
+container = "love-ai-api"
+compose_file = "/home/janpow/Projekte/x_chat/love-ai/docker-compose.yml"
+compose_service = "api"
+workload_types = ["llm", "embeddings"]
+gpu_priority = 2
+gpu_device = "0000:05:00.0"
+cuda_fallback_device = "0000:02:00.0"
+vram_estimate_mb = 2048
+restart_on_fallback = false
+remote_capable = ["llm", "embeddings"]
+cuda_only = []
+
 # --- Remote GPU (LanGPU) ---
 
 [remote]
@@ -160,7 +174,7 @@ default_provider = "ollama"
 [[llm_gateway.providers]]
 name = "ollama"
 provider_type = "openai_compatible"
-base_url = "http://localhost:11434/v1"
+base_url = "http://localhost:11434"
 api_key_ref = ""
 models = ["qwen3:14b", "qwen3:8b", "qwen3:1.7b"]
 enabled = true
