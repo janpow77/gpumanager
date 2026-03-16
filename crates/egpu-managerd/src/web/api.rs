@@ -1588,19 +1588,41 @@ pub async fn get_discover(State(state): State<Arc<AppState>>) -> impl IntoRespon
         })
         .collect();
 
+    let port = cfg.local_api.port;
+    let llm_gateway_active = state.llm_router.is_some();
+
     Json(serde_json::json!({
         "service": "egpu-manager",
         "version": env!("CARGO_PKG_VERSION"),
         "description": "eGPU Manager — GPU Monitoring, Scheduling, LLM Gateway",
-        "base_url": format!("http://localhost:{}", cfg.local_api.port),
+        "base_url": {
+            "host": format!("http://localhost:{port}"),
+            "docker": format!("http://host.docker.internal:{port}"),
+            "note": "Docker-Container muessen host.docker.internal nutzen (--add-host=host.docker.internal:host-gateway)"
+        },
         "auth": {
             "type": if cfg.local_api.api_token.is_empty() { "none" } else { "bearer" },
             "header": "Authorization",
             "note": "Bearer-Token nur fuer destruktive Endpunkte (POST). GET ist frei."
         },
+        "llm_gateway": {
+            "active": llm_gateway_active,
+            "note": if llm_gateway_active {
+                "LLM Gateway ist aktiv und nimmt Requests an"
+            } else {
+                "[llm_gateway] Section in /etc/egpu-manager/config.toml fehlt oder enabled=false"
+            }
+        },
         "gpus": gpus,
         "egpu_pci_address": cfg.gpu.egpu_pci_address,
         "internal_pci_address": cfg.gpu.internal_pci_address,
+        "recommended_workflow": {
+            "step_1": "GET /api/v1/discover — API kennenlernen, GPUs + UUIDs abrufen",
+            "step_2": "POST /api/gpu/acquire — Lease anfordern (liefert gpu_uuid + nvidia_index)",
+            "step_3": "Im Worker: cuda:{nvidia_index} als Device nutzen",
+            "step_4": "POST /api/gpu/release — Lease freigeben wenn fertig",
+            "note": "NVIDIA_VISIBLE_DEVICES ist ein Startzeit-Mechanismus. Fuer Laufzeit-Switching: Lease-basiertes Device-Mapping ueber nvidia_index verwenden."
+        },
         "endpoints": {
             "status": {
                 "method": "GET",
@@ -1656,10 +1678,17 @@ pub async fn get_discover(State(state): State<Arc<AppState>>) -> impl IntoRespon
         },
         "integration": {
             "python_client": "pip install egpu-llm-client (oder clients/python/egpu_llm_client.py kopieren)",
-            "docker_access": "http://host.docker.internal:{port} (Linux: --add-host=host.docker.internal:host-gateway)",
+            "docker_compose": {
+                "extra_hosts": "host.docker.internal:host-gateway",
+                "environment": format!("EGPU_MANAGER_URL=http://host.docker.internal:{port}"),
+                "note": "In docker-compose.yml: extra_hosts und EGPU_MANAGER_URL setzen"
+            },
             "env_vars": {
-                "EGPU_MANAGER_URL": format!("http://localhost:{}", cfg.local_api.port),
-                "NVIDIA_VISIBLE_DEVICES": "GPU-UUID aus /api/gpu/acquire oder /api/v1/discover"
+                "EGPU_MANAGER_URL": {
+                    "host": format!("http://localhost:{port}"),
+                    "docker": format!("http://host.docker.internal:{port}")
+                },
+                "CUDA_DEVICE": "nvidia_index aus /api/gpu/acquire (z.B. cuda:1 fuer eGPU)"
             }
         }
     }))

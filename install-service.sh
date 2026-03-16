@@ -31,6 +31,14 @@ if [ -f /etc/egpu-manager/config.toml ]; then
     sudo cp /etc/egpu-manager/config.toml "/etc/egpu-manager/backups/config.toml.bak.$(date +%Y%m%d_%H%M%S)"
     echo "  Neues Template: /etc/egpu-manager/config.toml.new"
     sudo cp "$SCRIPT_DIR/config.toml" /etc/egpu-manager/config.toml.new
+    # [llm_gateway] Section hinzufügen wenn fehlend
+    if ! grep -q '\[llm_gateway\]' /etc/egpu-manager/config.toml; then
+        echo "  [llm_gateway] Section wird hinzugefuegt..."
+        echo '' | sudo tee -a /etc/egpu-manager/config.toml > /dev/null
+        echo '[llm_gateway]' | sudo tee -a /etc/egpu-manager/config.toml > /dev/null
+        echo 'enabled = true' | sudo tee -a /etc/egpu-manager/config.toml > /dev/null
+        echo 'default_provider = "ollama"' | sudo tee -a /etc/egpu-manager/config.toml > /dev/null
+    fi
 else
     sudo cp "$SCRIPT_DIR/config.toml" /etc/egpu-manager/config.toml
 fi
