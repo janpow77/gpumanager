@@ -133,90 +133,12 @@ impl NvmlGpuMonitor {
         let mut gpus = Vec::with_capacity(count as usize);
 
         for idx in 0..count {
-            let device = self
-                .nvml
-                .device_by_index(idx)
-                .map_err(|e| GpuError::NvmlError(format!("device_by_index({idx}): {e}")))?;
-
-            let pci_info = device
-                .pci_info()
-                .map_err(|e| GpuError::NvmlError(format!("pci_info: {e}")))?;
-            let pci_address = normalize_pci_address(&pci_info.bus_id);
-
-            let name = device.name().unwrap_or_else(|_| "Unknown GPU".to_string());
-
-            let gpu_uuid = device
-                .uuid()
-                .unwrap_or_else(|_| read_gpu_uuid(&pci_address).unwrap_or_default());
-
-            let temperature_c = device
-                .temperature(TemperatureSensor::Gpu)
-                .unwrap_or(0);
-
-            let utilization = device.utilization_rates().ok();
-            let utilization_gpu_percent = utilization.map(|u| u.gpu).unwrap_or(0);
-
-            let memory_info = device.memory_info().ok();
-            let memory_used_mb = memory_info
-                .as_ref()
-                .map(|m| m.used / (1024 * 1024))
-                .unwrap_or(0);
-            let memory_free_mb = memory_info
-                .as_ref()
-                .map(|m| m.free / (1024 * 1024))
-                .unwrap_or(0);
-            let memory_total_mb = memory_info
-                .as_ref()
-                .map(|m| m.total / (1024 * 1024))
-                .unwrap_or(0);
-
-            let power_draw_w = device
-                .power_usage()
-                .map(|mw| mw as f64 / 1000.0)
-                .unwrap_or(0.0);
-
-            let pstate = device
-                .performance_state()
-                .map(|p| format!("{p:?}"))
-                .unwrap_or_else(|_| "Unknown".to_string());
-
-            let fan_speed_percent = device.fan_speed(0).unwrap_or(0);
-
-            let clock_graphics_mhz = device
-                .clock_info(nvml_wrapper::enum_wrappers::device::Clock::Graphics)
-                .unwrap_or(0);
-            let clock_memory_mhz = device
-                .clock_info(nvml_wrapper::enum_wrappers::device::Clock::Memory)
-                .unwrap_or(0);
-
-            let throttle_reason = self.format_throttle_reasons(&device);
-
-            // Read NUMA node from sysfs
-            let numa_path = format!("/sys/bus/pci/devices/{}/numa_node", pci_address);
-            let numa_node = std::fs::read_to_string(&numa_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<i32>().ok());
-
-            gpus.push(GpuStatus {
-                pci_address,
-                nvidia_index: Some(idx),
-                gpu_uuid,
-                name,
-                gpu_type: GpuType::Internal,
-                temperature_c,
-                utilization_gpu_percent,
-                memory_used_mb,
-                memory_free_mb,
-                memory_total_mb,
-                power_draw_w,
-                pstate,
-                fan_speed_percent,
-                clock_graphics_mhz,
-                clock_memory_mhz,
-                throttle_reason,
-                status: GpuOnlineStatus::Online,
-                numa_node,
-            });
+            match self.query_single_device(idx) {
+                Ok(gpu) => gpus.push(gpu),
+                Err(e) => {
+                    warn!("GPU {idx} uebersprungen (NVML-Fehler, evtl. temporaer nicht erreichbar): {e}");
+                }
+            }
         }
 
         if gpus.is_empty() {
@@ -227,6 +149,95 @@ impl NvmlGpuMonitor {
 
         debug!("{} GPU(s) über NVML abgefragt", gpus.len());
         Ok(gpus)
+    }
+
+    /// Query a single GPU by NVML index. Errors are non-fatal so callers
+    /// can skip unavailable devices (e.g. eGPU temporarily unreachable).
+    fn query_single_device(&self, idx: u32) -> Result<GpuStatus, GpuError> {
+        let device = self
+            .nvml
+            .device_by_index(idx)
+            .map_err(|e| GpuError::NvmlError(format!("device_by_index({idx}): {e}")))?;
+
+        let pci_info = device
+            .pci_info()
+            .map_err(|e| GpuError::NvmlError(format!("pci_info: {e}")))?;
+        let pci_address = normalize_pci_address(&pci_info.bus_id);
+
+        let name = device.name().unwrap_or_else(|_| "Unknown GPU".to_string());
+
+        let gpu_uuid = device
+            .uuid()
+            .unwrap_or_else(|_| read_gpu_uuid(&pci_address).unwrap_or_default());
+
+        let temperature_c = device
+            .temperature(TemperatureSensor::Gpu)
+            .unwrap_or(0);
+
+        let utilization = device.utilization_rates().ok();
+        let utilization_gpu_percent = utilization.map(|u| u.gpu).unwrap_or(0);
+
+        let memory_info = device.memory_info().ok();
+        let memory_used_mb = memory_info
+            .as_ref()
+            .map(|m| m.used / (1024 * 1024))
+            .unwrap_or(0);
+        let memory_free_mb = memory_info
+            .as_ref()
+            .map(|m| m.free / (1024 * 1024))
+            .unwrap_or(0);
+        let memory_total_mb = memory_info
+            .as_ref()
+            .map(|m| m.total / (1024 * 1024))
+            .unwrap_or(0);
+
+        let power_draw_w = device
+            .power_usage()
+            .map(|mw| mw as f64 / 1000.0)
+            .unwrap_or(0.0);
+
+        let pstate = device
+            .performance_state()
+            .map(|p| format!("{p:?}"))
+            .unwrap_or_else(|_| "Unknown".to_string());
+
+        let fan_speed_percent = device.fan_speed(0).unwrap_or(0);
+
+        let clock_graphics_mhz = device
+            .clock_info(nvml_wrapper::enum_wrappers::device::Clock::Graphics)
+            .unwrap_or(0);
+        let clock_memory_mhz = device
+            .clock_info(nvml_wrapper::enum_wrappers::device::Clock::Memory)
+            .unwrap_or(0);
+
+        let throttle_reason = self.format_throttle_reasons(&device);
+
+        // Read NUMA node from sysfs
+        let numa_path = format!("/sys/bus/pci/devices/{}/numa_node", pci_address);
+        let numa_node = std::fs::read_to_string(&numa_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok());
+
+        Ok(GpuStatus {
+            pci_address,
+            nvidia_index: Some(idx),
+            gpu_uuid,
+            name,
+            gpu_type: GpuType::Internal,
+            temperature_c,
+            utilization_gpu_percent,
+            memory_used_mb,
+            memory_free_mb,
+            memory_total_mb,
+            power_draw_w,
+            pstate,
+            fan_speed_percent,
+            clock_graphics_mhz,
+            clock_memory_mhz,
+            throttle_reason,
+            status: GpuOnlineStatus::Online,
+            numa_node,
+        })
     }
 
     /// Query PCIe throughput for a specific GPU.
