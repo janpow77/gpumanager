@@ -69,9 +69,9 @@ impl RecoveryStage {
         match self {
             RecoveryStage::Idle => 0,
             RecoveryStage::Stage0Quiesce => 30,
-            RecoveryStage::Stage1PcieReset => 15,
+            RecoveryStage::Stage1PcieReset => 45,
             RecoveryStage::Stage2Migration => 120,
-            RecoveryStage::Stage3ThunderboltReconnect => 30,
+            RecoveryStage::Stage3ThunderboltReconnect => 45,
             RecoveryStage::Stage4ManualIntervention => 0, // No timeout - manual
         }
     }
@@ -114,6 +114,7 @@ impl RecoveryStateMachine {
         }
     }
 
+    #[cfg(test)]
     pub fn current_stage(&self) -> RecoveryStage {
         self.stage
     }
@@ -122,6 +123,7 @@ impl RecoveryStateMachine {
         self.stage != RecoveryStage::Idle
     }
 
+    #[cfg(test)]
     pub fn affected_pipelines(&self) -> &[String] {
         &self.affected.pipelines
     }
@@ -397,19 +399,30 @@ impl RecoveryStateMachine {
         match pcie.function_level_reset(&config.gpu.egpu_pci_address).await {
             Ok(()) => {
                 info!("PCIe FLR erfolgreich für {}", config.gpu.egpu_pci_address);
-                // Check if nvidia-smi works after reset
-                match check_nvidia_smi_available().await {
-                    true => {
-                        info!("nvidia-smi nach FLR erreichbar - Recovery erfolgreich");
-                        Ok(StageResult::Success)
+                // Readiness-Polling: nvidia-smi kann nach FLR einige Sekunden brauchen
+                const FLR_RETRIES: u32 = 6;
+                const FLR_RETRY_DELAY: Duration = Duration::from_secs(2);
+                for attempt in 1..=FLR_RETRIES {
+                    tokio::time::sleep(FLR_RETRY_DELAY).await;
+                    if check_nvidia_smi_available().await {
+                        info!(
+                            "nvidia-smi nach FLR erreichbar (Versuch {}/{})",
+                            attempt, FLR_RETRIES
+                        );
+                        return Ok(StageResult::Success);
                     }
-                    false => {
-                        warn!("nvidia-smi nach FLR nicht erreichbar");
-                        Ok(StageResult::Failed(
-                            "nvidia-smi nach FLR nicht erreichbar".to_string(),
-                        ))
-                    }
+                    info!(
+                        "nvidia-smi nach FLR noch nicht erreichbar (Versuch {}/{})",
+                        attempt, FLR_RETRIES
+                    );
                 }
+                warn!(
+                    "nvidia-smi nach FLR nicht erreichbar nach {} Versuchen",
+                    FLR_RETRIES
+                );
+                Ok(StageResult::Failed(
+                    "nvidia-smi nach FLR nicht erreichbar (alle Retries erschoepft)".to_string(),
+                ))
             }
             Err(e) => {
                 warn!("PCIe FLR fehlgeschlagen: {}", e);
@@ -541,8 +554,8 @@ impl RecoveryStateMachine {
             )));
         }
 
-        // Wait before reauth
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Minimale Settle-Time vor Reauth (Thunderbolt-Controller braucht kurz)
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
         // Reauthorize
         info!("Thunderbolt reauthorize: {}", tb_config.device_path);
@@ -553,28 +566,85 @@ impl RecoveryStateMachine {
             )));
         }
 
-        // Verify authorization
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Readiness-Polling: Warte auf PCI-Device-Wiedererscheinen via sysfs
+        let pci_vendor_path = format!(
+            "/sys/bus/pci/devices/{}/vendor",
+            config.gpu.egpu_pci_address
+        );
+        const TB_POLL_INTERVAL: Duration = Duration::from_millis(500);
+        const TB_POLL_DEADLINE: Duration = Duration::from_secs(15);
+        let poll_start = tokio::time::Instant::now();
+        let mut pci_device_found = false;
+
+        info!(
+            "Warte auf PCI-Device {} (Deadline: {}s)",
+            config.gpu.egpu_pci_address,
+            TB_POLL_DEADLINE.as_secs()
+        );
+        while poll_start.elapsed() < TB_POLL_DEADLINE {
+            if tokio::fs::metadata(&pci_vendor_path).await.is_ok() {
+                info!(
+                    "PCI-Device {} in sysfs gefunden nach {:.1}s",
+                    config.gpu.egpu_pci_address,
+                    poll_start.elapsed().as_secs_f64()
+                );
+                pci_device_found = true;
+                break;
+            }
+            tokio::time::sleep(TB_POLL_INTERVAL).await;
+        }
+
+        if !pci_device_found {
+            warn!(
+                "PCI-Device {} nach {}s nicht in sysfs erschienen",
+                config.gpu.egpu_pci_address,
+                TB_POLL_DEADLINE.as_secs()
+            );
+            return Ok(StageResult::Failed(format!(
+                "PCI-Device {} nach Thunderbolt-Reconnect nicht erschienen",
+                config.gpu.egpu_pci_address
+            )));
+        }
+
+        // Thunderbolt-Autorisierung verifizieren
         match thunderbolt.is_authorized(&tb_config.device_path).await {
             Ok(true) => {
                 info!("Thunderbolt-Gerät erfolgreich re-autorisiert");
-                // Check nvidia-smi after reconnect
-                if check_nvidia_smi_available().await {
-                    info!("nvidia-smi nach Thunderbolt-Reconnect erreichbar");
-                    Ok(StageResult::Success)
-                } else {
-                    Ok(StageResult::Failed(
-                        "nvidia-smi nach Thunderbolt-Reconnect nicht erreichbar".to_string(),
-                    ))
-                }
             }
-            Ok(false) => Ok(StageResult::Failed(
-                "Thunderbolt-Gerät nicht autorisiert nach Reconnect".to_string(),
-            )),
-            Err(e) => Ok(StageResult::Failed(format!(
-                "Thunderbolt-Status nicht lesbar: {e}"
-            ))),
+            Ok(false) => {
+                return Ok(StageResult::Failed(
+                    "Thunderbolt-Gerät nicht autorisiert nach Reconnect".to_string(),
+                ));
+            }
+            Err(e) => {
+                return Ok(StageResult::Failed(format!(
+                    "Thunderbolt-Status nicht lesbar: {e}"
+                )));
+            }
         }
+
+        // nvidia-smi Readiness-Polling (PCI-Device da, aber Treiber braucht noch)
+        const TB_SMI_RETRIES: u32 = 3;
+        const TB_SMI_RETRY_DELAY: Duration = Duration::from_secs(2);
+        for attempt in 1..=TB_SMI_RETRIES {
+            tokio::time::sleep(TB_SMI_RETRY_DELAY).await;
+            if check_nvidia_smi_available().await {
+                info!(
+                    "nvidia-smi nach Thunderbolt-Reconnect erreichbar (Versuch {}/{})",
+                    attempt, TB_SMI_RETRIES
+                );
+                return Ok(StageResult::Success);
+            }
+            info!(
+                "nvidia-smi nach Thunderbolt-Reconnect noch nicht erreichbar (Versuch {}/{})",
+                attempt, TB_SMI_RETRIES
+            );
+        }
+
+        Ok(StageResult::Failed(
+            "nvidia-smi nach Thunderbolt-Reconnect nicht erreichbar (alle Retries erschoepft)"
+                .to_string(),
+        ))
     }
 
     /// Stage 4: Manual intervention - log failure and notify.
@@ -692,14 +762,6 @@ impl RecoveryStateMachine {
     }
 }
 
-/// Generate the override file path for a service.
-/// Wenn override_dir gesetzt (nicht leer), werden Overrides dort abgelegt
-/// (Permission-sicher, da /var/lib/egpu-manager/ dem Daemon gehoert).
-/// Sonst Fallback auf das Compose-Verzeichnis.
-pub fn generate_override_path(compose_file: &str, service: &str) -> String {
-    generate_override_path_with_dir(compose_file, service, "")
-}
-
 /// Generate override path mit explizitem override_dir.
 pub fn generate_override_path_with_dir(
     compose_file: &str,
@@ -762,6 +824,35 @@ async fn check_nvidia_smi_available() -> bool {
     }
 }
 
+/// Zaehle aktive Monitore via `xrandr --listmonitors`.
+/// Gibt 0 zurueck wenn xrandr nicht verfuegbar oder ein Fehler auftritt.
+async fn count_xrandr_monitors() -> u32 {
+    use tokio::process::Command;
+    let output = Command::new("xrandr")
+        .arg("--listmonitors")
+        .env("DISPLAY", ":0")
+        .env("XAUTHORITY", "/run/user/1000/gdm/Xauthority")
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            // Erste Zeile ist "Monitors: N", danach je eine Zeile pro Monitor
+            stdout
+                .lines()
+                .next()
+                .and_then(|line| {
+                    line.trim()
+                        .strip_prefix("Monitors: ")
+                        .and_then(|n| n.parse::<u32>().ok())
+                })
+                .unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
 /// Loesche alle Display-Outputs die ueber eine bestimmte GPU laufen.
 /// Nutzt xrandr um Outputs zu identifizieren und zu deaktivieren.
 /// Gibt die Anzahl deaktivierter Outputs zurueck.
@@ -789,7 +880,7 @@ pub async fn detach_egpu_displays(egpu_pci_address: &str) -> anyhow::Result<u32>
 
     // Schritt 2: xrandr --listmonitors um aktive Monitore zu finden
     // Dann verbundene Outputs mit eGPU-Karten abgleichen
-    let xrandr_output = match Command::new("xrandr")
+    let _xrandr_output = match Command::new("xrandr")
         .arg("--listmonitors")
         .env("DISPLAY", ":0")
         .env("XAUTHORITY", "/run/user/1000/gdm/Xauthority")
@@ -812,7 +903,7 @@ pub async fn detach_egpu_displays(egpu_pci_address: &str) -> anyhow::Result<u32>
     let mut detached = 0u32;
 
     // Finde alle xrandr Outputs und pruefe welche zur eGPU gehoeren
-    let providers_output = Command::new("xrandr")
+    let _providers_output = Command::new("xrandr")
         .arg("--listproviders")
         .env("DISPLAY", ":0")
         .env("XAUTHORITY", "/run/user/1000/gdm/Xauthority")
@@ -871,9 +962,26 @@ pub async fn detach_egpu_displays(egpu_pci_address: &str) -> anyhow::Result<u32>
         }
     }
 
-    // Schritt 4: Warte kurz damit der Display-Server die Aenderung verarbeitet
+    // Schritt 4: Polling statt fester Delay — pruefe ob Monitor-Count gesunken ist
     if detached > 0 {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Aktuelle Monitor-Anzahl vor dem Polling ermitteln (bereits detached,
+        // aber Display-Server braucht kurz fuer die Verarbeitung)
+        let initial_count = count_xrandr_monitors().await;
+        const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(200);
+        const DETACH_POLL_DEADLINE: Duration = Duration::from_secs(2);
+        let poll_start = tokio::time::Instant::now();
+
+        while poll_start.elapsed() < DETACH_POLL_DEADLINE {
+            tokio::time::sleep(DETACH_POLL_INTERVAL).await;
+            let current_count = count_xrandr_monitors().await;
+            if current_count < initial_count {
+                info!(
+                    "Display-Server hat Detach verarbeitet (Monitore: {} -> {})",
+                    initial_count, current_count
+                );
+                break;
+            }
+        }
     }
 
     Ok(detached)
@@ -891,9 +999,8 @@ async fn detach_egpu_displays_wayland(egpu_pci_address: &str) -> anyhow::Result<
 
     if let Ok(output) = result {
         if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let _stdout = String::from_utf8_lossy(&output.stdout);
             // gnome-randr zeigt Outputs mit Connector-Infos
-            // Parse und deaktiviere eGPU-Outputs
             info!("gnome-randr verfuegbar, parse Outputs");
             // TODO: gnome-randr Output parsen wenn vorhanden
         }
@@ -1141,15 +1248,6 @@ mod tests {
         assert!(RecoveryStage::Stage2Migration.timeout_seconds() > 0);
         assert!(RecoveryStage::Stage3ThunderboltReconnect.timeout_seconds() > 0);
         assert_eq!(RecoveryStage::Stage4ManualIntervention.timeout_seconds(), 0);
-    }
-
-    #[test]
-    fn test_generate_override_path() {
-        let path = generate_override_path("/opt/project/docker-compose.yml", "worker");
-        assert_eq!(
-            path,
-            "/opt/project/docker-compose.egpu-fallback.worker.yml"
-        );
     }
 
     #[test]

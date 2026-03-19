@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use chrono::{Datelike, Utc};
 
 use super::router::AppUsageSummary;
@@ -73,21 +71,6 @@ impl BudgetTracker {
         }
     }
 
-    /// Get total monthly cost across all apps.
-    pub fn total_monthly_cost(&self) -> f64 {
-        let now = Utc::now();
-        self.records
-            .iter()
-            .filter(|r| r.timestamp.year() == now.year() && r.timestamp.month() == now.month())
-            .map(|r| r.cost_usd)
-            .sum()
-    }
-
-    /// Prune records older than the given number of days.
-    pub fn prune_old_records(&mut self, keep_days: u32) {
-        let cutoff = Utc::now() - chrono::Duration::days(keep_days as i64);
-        self.records.retain(|r| r.timestamp >= cutoff);
-    }
 }
 
 #[cfg(test)]
@@ -145,12 +128,4 @@ mod tests {
         assert!((summary.total_cost_usd - 0.11).abs() < 0.001);
     }
 
-    #[test]
-    fn test_total_monthly() {
-        let mut tracker = BudgetTracker::new();
-        tracker.record_usage(make_record("app1", "ollama", 0.50));
-        tracker.record_usage(make_record("app2", "anthropic", 1.50));
-
-        assert!((tracker.total_monthly_cost() - 2.0).abs() < 0.001);
-    }
 }

@@ -135,7 +135,6 @@ pub struct MigrationAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum MigrationActionType {
     /// Block new tasks from being scheduled on eGPU
     BlockNewTasks,
@@ -232,6 +231,7 @@ impl WarningStateMachine {
 
     /// Clear a specific trigger type. Returns `Some(new_level)` if the level
     /// stepped down as a result.
+    // TODO: Integration in monitor.rs
     #[allow(dead_code)]
     pub fn clear_trigger(&mut self, trigger: &WarningTrigger) -> Option<WarningLevel> {
         self.active_triggers.retain(|t| t != trigger);
@@ -365,6 +365,7 @@ impl WarningStateMachine {
     /// Get re-migration actions when transitioning from Yellow to Green.
     /// Returns pipelines sorted by priority (lowest first) for step-by-step
     /// re-migration with 30s gaps between each.
+    // TODO: Integration in monitor.rs
     #[allow(dead_code)]
     pub fn remigration_order(
         &self,

@@ -31,6 +31,8 @@ pub struct AppState {
     pub started_at: Instant,
     pub llm_router: Option<Arc<crate::llm::router::LlmRouter>>,
     pub metrics_state: Option<Arc<Mutex<MetricsState>>>,
+    pub ollama_fleet: Option<Arc<crate::ollama::OllamaFleet>>,
+    pub daemon_metrics: Option<Arc<crate::metrics::DaemonMetrics>>,
 }
 
 /// Serve the embedded HTML UI at root.
@@ -132,6 +134,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/egpu/admission", post(api::post_egpu_admission))
         // Ollama
         .route("/api/ollama/status", get(api::get_ollama_status))
+        .route("/api/ollama/instances", get(api::get_ollama_instances))
         .route("/api/ollama/unload", post(api::post_ollama_unload))
         // Recovery
         .route("/api/recovery/status", get(api::get_recovery_status))
@@ -173,6 +176,14 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/llm/chat/completions",
             post(api::post_llm_chat_completions),
         )
+        .route(
+            "/api/llm/embeddings",
+            post(api::post_llm_embeddings),
+        )
+        .route(
+            "/api/llm/staging",
+            post(api::post_llm_staging),
+        )
         .route("/api/llm/providers", get(api::get_llm_providers))
         .route("/api/llm/usage/{app_id}", get(api::get_llm_usage))
         .route("/api/llm/health", get(api::get_llm_health))
@@ -195,6 +206,8 @@ pub async fn start_web_server(
     cancel: CancellationToken,
     sse: SseBroadcaster,
     metrics_state: Option<Arc<Mutex<MetricsState>>>,
+    ollama_fleet: Option<Arc<crate::ollama::OllamaFleet>>,
+    daemon_metrics: Option<Arc<crate::metrics::DaemonMetrics>>,
 ) {
     // LLM Gateway initialisieren falls konfiguriert
     let llm_router = config
@@ -204,7 +217,13 @@ pub async fn start_web_server(
         .map(|gw| {
             let secrets =
                 crate::llm::router::LlmSecrets::load("/etc/egpu-manager/llm-secrets.toml");
-            Arc::new(crate::llm::router::LlmRouter::new(gw.clone(), &secrets))
+            let mut router = crate::llm::router::LlmRouter::new(gw.clone(), &secrets);
+            // GPU-Aware Routing: MonitorState + Fleet injizieren
+            router.set_monitor_state(Arc::clone(&monitor_state));
+            if let Some(ref fleet) = ollama_fleet {
+                router.set_ollama_fleet(Arc::clone(fleet));
+            }
+            Arc::new(router)
         });
 
     // Bind-Adresse und Port vor dem ArcSwap-Move auslesen
@@ -225,6 +244,8 @@ pub async fn start_web_server(
         started_at: Instant::now(),
         llm_router,
         metrics_state,
+        ollama_fleet,
+        daemon_metrics,
     });
 
     let router = build_router(state);
@@ -322,6 +343,7 @@ mod tests {
             gpu_status,
             pcie_throughput: HashMap::new(),
             ollama_models: Vec::new(),
+            ollama_models_by_instance: HashMap::new(),
             active_leases: HashMap::new(),
             recovery_active: false,
             remote_gpus: Vec::new(),
@@ -335,6 +357,8 @@ mod tests {
             started_at: Instant::now(),
             llm_router: None,
             metrics_state: None,
+            ollama_fleet: None,
+            daemon_metrics: None,
         })
     }
 
@@ -391,6 +415,7 @@ mod tests {
             gpu_status: Vec::new(),
             pcie_throughput: HashMap::new(),
             ollama_models: Vec::new(),
+            ollama_models_by_instance: HashMap::new(),
             active_leases: HashMap::new(),
             recovery_active: false,
             remote_gpus: vec![RegisteredRemoteGpu {
@@ -414,6 +439,8 @@ mod tests {
             started_at: Instant::now(),
             llm_router: None,
             metrics_state: None,
+            ollama_fleet: None,
+            daemon_metrics: None,
         })
     }
 

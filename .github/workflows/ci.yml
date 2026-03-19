@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.check }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [test, clippy, fmt]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libappindicator3-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        if: matrix.check == 'test'
+        run: cargo test --workspace
+
+      - name: cargo clippy
+        if: matrix.check == 'clippy'
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: cargo fmt
+        if: matrix.check == 'fmt'
+        run: cargo fmt --all -- --check
+
+  python-client:
+    name: Python Client Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests pytest
+
+      - name: Run tests
+        working-directory: clients/python
+        run: python -m pytest test_egpu_llm_client.py -v
+
+  config-validate:
+    name: Config Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build CLI
+        run: cargo build -p egpu-manager-cli
+
+      - name: Validate config.toml
+        run: cargo run -p egpu-manager-cli -- config validate --path config.toml

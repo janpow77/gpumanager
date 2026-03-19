@@ -79,43 +79,6 @@ impl LlmProvider for OpenAiCompatProvider {
         Ok(response)
     }
 
-    async fn chat_completion_stream(
-        &self,
-        request: &ChatCompletionRequest,
-    ) -> Result<Vec<ChatCompletionChunk>, ProviderError> {
-        let mut stream_request = request.clone();
-        stream_request.stream = true;
-
-        let resp = self.build_request(&stream_request).send().await?;
-        let status = resp.status().as_u16();
-
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
-                status,
-                message: body,
-            });
-        }
-
-        // SSE-Antwort zeilenweise parsen
-        let body = resp.text().await?;
-        let mut chunks = Vec::new();
-
-        for line in body.lines() {
-            let line = line.trim();
-            if line.is_empty() || line == "data: [DONE]" {
-                continue;
-            }
-            if let Some(data) = line.strip_prefix("data: ") {
-                if let Ok(chunk) = serde_json::from_str::<ChatCompletionChunk>(data) {
-                    chunks.push(chunk);
-                }
-            }
-        }
-
-        Ok(chunks)
-    }
-
     async fn health_check(&self) -> bool {
         let url = format!("{}/v1/models", self.base_url);
         let mut req = self.client.get(&url);

@@ -46,6 +46,14 @@ pub struct Config {
 
     #[serde(default)]
     pub llm_gateway: Option<LlmGatewayConfig>,
+
+    /// Multi-Instanz Ollama-Konfiguration (ersetzt [ollama] bei Bedarf)
+    #[serde(default)]
+    pub ollama_instance: Vec<OllamaInstanceConfig>,
+
+    /// Workload-Typ-Definitionen für GPU-Routing
+    #[serde(default)]
+    pub workload_type: Vec<WorkloadTypeConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -578,6 +586,44 @@ fn default_on_demand() -> String {
     "on-demand".to_string()
 }
 
+/// Multi-Instanz Ollama-Konfiguration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OllamaInstanceConfig {
+    pub name: String,
+    #[serde(default = "default_ollama_host")]
+    pub host: String,
+    #[serde(default)]
+    pub gpu_device: String,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub workload_types: Vec<String>,
+    #[serde(default = "default_1_u32")]
+    pub priority: u32,
+    #[serde(default = "default_14000")]
+    pub max_vram_mb: u64,
+    #[serde(default = "default_10_u64")]
+    pub auto_unload_idle_minutes: u64,
+    #[serde(default = "default_75")]
+    pub thermal_unload_temp_c: u32,
+}
+
+/// Workload-Typ-Definition für GPU-Routing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkloadTypeConfig {
+    pub name: String,
+    #[serde(default)]
+    pub preferred_gpu: String,
+    #[serde(default)]
+    pub cuda_required: bool,
+    #[serde(default)]
+    pub latency_sensitive: bool,
+    #[serde(default)]
+    pub typical_vram_mb: u64,
+    #[serde(default)]
+    pub remote_capable: bool,
+}
+
 fn default_ollama_provider() -> String {
     "ollama".to_string()
 }
@@ -658,6 +704,9 @@ pub struct AppRoutingConfig {
     /// Allowed models (empty = all from allowed providers)
     #[serde(default)]
     pub allowed_models: Vec<String>,
+    /// Workload-Typ -> Modell-Mapping (z.B. { embeddings = "nomic-embed-text", llm = "qwen3:14b" })
+    #[serde(default)]
+    pub workload_model_map: HashMap<String, String>,
 }
 
 impl Config {
@@ -668,6 +717,32 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("Konfiguration ungültig: {e}"))?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Gibt die effektive Liste der Ollama-Instanzen zurück.
+    /// Wenn `ollama_instance` leer aber `[ollama]` gesetzt ist, wird aus der
+    /// Legacy-Config ein 1-Element-Vec erzeugt (Backward-Kompatibilität).
+    pub fn resolve_ollama_instances(&self) -> Vec<OllamaInstanceConfig> {
+        if !self.ollama_instance.is_empty() {
+            return self.ollama_instance.clone();
+        }
+        // Legacy: konvertiere [ollama] in eine Instanz
+        if let Some(ref ollama) = self.ollama {
+            if ollama.enabled {
+                return vec![OllamaInstanceConfig {
+                    name: "ollama".to_string(),
+                    host: ollama.host.clone(),
+                    gpu_device: ollama.gpu_device.clone(),
+                    models: Vec::new(),
+                    workload_types: vec!["llm".to_string(), "embeddings".to_string()],
+                    priority: ollama.priority,
+                    max_vram_mb: ollama.max_vram_mb,
+                    auto_unload_idle_minutes: ollama.auto_unload_idle_minutes,
+                    thermal_unload_temp_c: ollama.thermal_unload_temp_c,
+                }];
+            }
+        }
+        Vec::new()
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -820,6 +895,144 @@ mod tests {
 
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_multi_ollama_instance_config() {
+        let toml_str = r#"
+            schema_version = 1
+
+            [gpu]
+            egpu_pci_address = "0000:05:00.0"
+            internal_pci_address = "0000:02:00.0"
+
+            [[ollama_instance]]
+            name = "ollama-egpu"
+            host = "http://localhost:11434"
+            gpu_device = "0000:05:00.0"
+            models = ["qwen3:14b", "nomic-embed-text"]
+            workload_types = ["llm", "embeddings"]
+            priority = 1
+            max_vram_mb = 14000
+
+            [[ollama_instance]]
+            name = "ollama-internal"
+            host = "http://localhost:11435"
+            gpu_device = "0000:02:00.0"
+            models = ["qwen3:8b"]
+            workload_types = ["ocr-assist", "staging"]
+            priority = 2
+            max_vram_mb = 6000
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.ollama_instance.len(), 2);
+        assert_eq!(config.ollama_instance[0].name, "ollama-egpu");
+        assert_eq!(config.ollama_instance[0].models.len(), 2);
+        assert_eq!(config.ollama_instance[1].name, "ollama-internal");
+        assert_eq!(config.ollama_instance[1].max_vram_mb, 6000);
+
+        let resolved = config.resolve_ollama_instances();
+        assert_eq!(resolved.len(), 2);
+    }
+
+    #[test]
+    fn test_backward_compat_single_ollama() {
+        let toml_str = r#"
+            schema_version = 1
+
+            [gpu]
+            egpu_pci_address = "0000:05:00.0"
+            internal_pci_address = "0000:02:00.0"
+
+            [ollama]
+            enabled = true
+            gpu_device = "0000:05:00.0"
+            fallback_device = "0000:02:00.0"
+            priority = 1
+            max_vram_mb = 14000
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        // Keine ollama_instance konfiguriert
+        assert!(config.ollama_instance.is_empty());
+        // Aber resolve_ollama_instances() erzeugt aus [ollama] eine Instanz
+        let resolved = config.resolve_ollama_instances();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "ollama");
+        assert_eq!(resolved[0].host, "http://localhost:11434");
+        assert_eq!(resolved[0].max_vram_mb, 14000);
+    }
+
+    #[test]
+    fn test_workload_type_config() {
+        let toml_str = r#"
+            schema_version = 1
+
+            [gpu]
+            egpu_pci_address = "0000:05:00.0"
+            internal_pci_address = "0000:02:00.0"
+
+            [[workload_type]]
+            name = "ocr"
+            preferred_gpu = "egpu"
+            cuda_required = true
+            typical_vram_mb = 1500
+
+            [[workload_type]]
+            name = "embeddings"
+            preferred_gpu = "egpu"
+            typical_vram_mb = 2000
+            remote_capable = true
+
+            [[workload_type]]
+            name = "llm"
+            preferred_gpu = "egpu"
+            latency_sensitive = true
+            typical_vram_mb = 10000
+
+            [[workload_type]]
+            name = "staging"
+            preferred_gpu = "internal"
+            latency_sensitive = true
+            typical_vram_mb = 4000
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.workload_type.len(), 4);
+        assert_eq!(config.workload_type[0].name, "ocr");
+        assert!(config.workload_type[0].cuda_required);
+        assert_eq!(config.workload_type[1].typical_vram_mb, 2000);
+        assert!(config.workload_type[1].remote_capable);
+        assert!(config.workload_type[2].latency_sensitive);
+        assert_eq!(config.workload_type[3].preferred_gpu, "internal");
+    }
+
+    #[test]
+    fn test_app_routing_workload_model_map() {
+        let toml_str = r#"
+            schema_version = 1
+
+            [gpu]
+            egpu_pci_address = "0000:05:00.0"
+            internal_pci_address = "0000:02:00.0"
+
+            [llm_gateway]
+            enabled = true
+
+            [[llm_gateway.app_routing]]
+            app_id = "audit_designer"
+            preferred_provider = "ollama-egpu"
+            allowed_providers = ["ollama-egpu", "anthropic"]
+            workload_model_map = { embeddings = "nomic-embed-text", llm = "qwen3:14b" }
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let gw = config.llm_gateway.unwrap();
+        assert_eq!(gw.app_routing.len(), 1);
+        let routing = &gw.app_routing[0];
+        assert_eq!(routing.workload_model_map.get("embeddings").unwrap(), "nomic-embed-text");
+        assert_eq!(routing.workload_model_map.get("llm").unwrap(), "qwen3:14b");
     }
 
     #[test]

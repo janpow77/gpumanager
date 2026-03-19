@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use egpu_manager_common::config::OllamaConfig;
 use egpu_manager_common::error::OllamaError;
 use egpu_manager_common::gpu::OllamaModel;
 use egpu_manager_common::hal::OllamaControl;
@@ -105,166 +104,133 @@ impl OllamaControl for HttpOllamaControl {
     }
 }
 
-/// Manage Ollama GPU fallback.
-pub struct OllamaManager {
-    config: OllamaConfig,
+
+// ─── OllamaFleet: Multi-Instanz-Management ───────────────────────────────
+
+/// Wrapper um eine einzelne Ollama-Instanz mit GPU-Zuordnung.
+pub struct OllamaInstanceControl {
+    pub config: egpu_manager_common::config::OllamaInstanceConfig,
+    pub control: HttpOllamaControl,
+    pub gpu_target: crate::scheduler::GpuTarget,
+    pub available: bool,
 }
 
-impl OllamaManager {
-    pub fn new(config: OllamaConfig) -> Self {
-        Self { config }
+/// Manager für mehrere Ollama-Instanzen auf verschiedenen GPUs.
+pub struct OllamaFleet {
+    instances: Vec<OllamaInstanceControl>,
+}
+
+impl OllamaFleet {
+    /// Erstellt eine neue Fleet aus Config-Instanzen.
+    pub fn new(
+        configs: Vec<egpu_manager_common::config::OllamaInstanceConfig>,
+        egpu_pci: &str,
+    ) -> Self {
+        let instances = configs
+            .into_iter()
+            .map(|cfg| {
+                let gpu_target = if cfg.gpu_device == egpu_pci {
+                    crate::scheduler::GpuTarget::Egpu
+                } else {
+                    crate::scheduler::GpuTarget::Internal
+                };
+                let control = HttpOllamaControl::new(&cfg.host);
+                OllamaInstanceControl {
+                    config: cfg,
+                    control,
+                    gpu_target,
+                    available: true,
+                }
+            })
+            .collect();
+        Self { instances }
     }
 
-    /// Switch Ollama to fallback GPU via helper service.
-    /// Writes target file and triggers systemd service.
-    pub async fn switch_to_fallback(&self) -> Result<(), OllamaError> {
-        let target_file = if self.config.gpu_target_file.is_empty() {
-            "/run/egpu-manager/ollama-gpu-target".to_string()
-        } else {
-            self.config.gpu_target_file.clone()
-        };
-
-        info!(
-            "Ollama GPU-Fallback: schreibe {} -> {}",
-            target_file, self.config.fallback_device
-        );
-
-        // Ensure directory exists
-        if let Some(parent) = std::path::Path::new(&target_file).parent()
-            && let Err(e) = tokio::fs::create_dir_all(parent).await
-        {
-            warn!("Verzeichnis nicht erstellbar: {}: {}", parent.display(), e);
-        }
-
-        // Write target file
-        tokio::fs::write(&target_file, &self.config.fallback_device)
-            .await
-            .map_err(|e| {
-                OllamaError::ApiError(format!(
-                    "GPU-Target-Datei nicht schreibbar: {target_file}: {e}"
-                ))
-            })?;
-
-        // Trigger helper service if configured
-        let service_name = if self.config.helper_service.is_empty() {
-            "egpu-ollama-fallback.service"
-        } else {
-            &self.config.helper_service
-        };
-
-        info!("Starte Helper-Service: {}", service_name);
-        let result = tokio::process::Command::new("sudo")
-            .args(["systemctl", "start", service_name])
-            .output()
-            .await;
-
-        match result {
-            Ok(output) if output.status.success() => {
-                info!("Helper-Service {} gestartet", service_name);
-                Ok(())
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                Err(OllamaError::ApiError(format!(
-                    "Helper-Service start fehlgeschlagen: {stderr}"
-                )))
-            }
-            Err(e) => Err(OllamaError::ApiError(format!(
-                "systemctl nicht ausführbar: {e}"
-            ))),
-        }
+    /// Gibt Instanzen zurück die den gegebenen Workload-Typ unterstützen.
+    pub fn instances_for_workload(&self, workload_type: &str) -> Vec<&OllamaInstanceControl> {
+        self.instances
+            .iter()
+            .filter(|i| i.available && i.config.workload_types.iter().any(|w| w == workload_type))
+            .collect()
     }
 
-    /// Switch Ollama back to eGPU.
-    pub async fn switch_to_egpu(&self) -> Result<(), OllamaError> {
-        let target_file = if self.config.gpu_target_file.is_empty() {
-            "/run/egpu-manager/ollama-gpu-target".to_string()
-        } else {
-            self.config.gpu_target_file.clone()
-        };
+    /// Findet eine Instanz anhand ihres Namens.
+    pub fn instance_by_name(&self, name: &str) -> Option<&OllamaInstanceControl> {
+        self.instances.iter().find(|i| i.config.name == name)
+    }
 
-        info!(
-            "Ollama GPU-Restore: schreibe {} -> {}",
-            target_file, self.config.gpu_device
-        );
+    /// Findet die Instanz die ein bestimmtes Modell konfiguriert hat.
+    pub fn instance_for_model(&self, model: &str) -> Option<&OllamaInstanceControl> {
+        self.instances
+            .iter()
+            .filter(|i| i.available)
+            .find(|i| i.config.models.iter().any(|m| m == model))
+    }
 
-        tokio::fs::write(&target_file, &self.config.gpu_device)
-            .await
-            .map_err(|e| {
-                OllamaError::ApiError(format!(
-                    "GPU-Target-Datei nicht schreibbar: {target_file}: {e}"
-                ))
-            })?;
-
-        let service_name = if self.config.helper_service.is_empty() {
-            "egpu-ollama-fallback.service"
-        } else {
-            &self.config.helper_service
-        };
-
-        let result = tokio::process::Command::new("sudo")
-            .args(["systemctl", "start", service_name])
-            .output()
-            .await;
-
-        match result {
-            Ok(output) if output.status.success() => {
-                info!("Helper-Service {} gestartet (GPU-Restore)", service_name);
-                Ok(())
+    /// Markiert alle Instanzen auf einer bestimmten GPU als (un-)verfügbar.
+    pub fn set_gpu_available(&mut self, target: crate::scheduler::GpuTarget, available: bool) {
+        for instance in &mut self.instances {
+            if instance.gpu_target == target {
+                if instance.available != available {
+                    if available {
+                        info!(
+                            "Ollama-Instanz '{}' wieder verfügbar (GPU {})",
+                            instance.config.name, target
+                        );
+                    } else {
+                        warn!(
+                            "Ollama-Instanz '{}' nicht verfügbar (GPU {} offline)",
+                            instance.config.name, target
+                        );
+                    }
+                    instance.available = available;
+                }
             }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                Err(OllamaError::ApiError(format!(
-                    "Helper-Service start fehlgeschlagen: {stderr}"
-                )))
-            }
-            Err(e) => Err(OllamaError::ApiError(format!(
-                "systemctl nicht ausführbar: {e}"
-            ))),
         }
     }
 
-    /// Perform model tier switching: unload current models and load
-    /// the tier-appropriate model.
-    pub async fn switch_model_tier(
+    /// Pollt alle verfügbaren Instanzen und gibt Modelle pro Instanz zurück.
+    pub async fn query_all_models(&self) -> HashMap<String, Vec<OllamaModel>> {
+        let mut result = HashMap::new();
+        for instance in &self.instances {
+            if !instance.available {
+                continue;
+            }
+            match instance.control.list_running_models().await {
+                Ok(models) => {
+                    result.insert(instance.config.name.clone(), models);
+                }
+                Err(e) => {
+                    debug!(
+                        "Ollama-Instanz '{}' nicht erreichbar: {}",
+                        instance.config.name, e
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    /// Entlädt ein Modell auf einer bestimmten Instanz.
+    pub async fn unload_model_on(
         &self,
-        ollama: &dyn OllamaControl,
-        egpu_available: bool,
+        instance_name: &str,
+        model: &str,
     ) -> Result<(), OllamaError> {
-        let tiers = match &self.config.model_tiers {
-            Some(t) => t,
-            None => {
-                debug!("Keine Model-Tiers konfiguriert, überspringe Tier-Switch");
-                return Ok(());
-            }
-        };
-
-        // Unload all currently running models
-        let running = ollama.list_running_models().await?;
-        for model in &running {
-            info!("Entlade Modell: {}", model.name);
-            ollama.unload_model(&model.name).await?;
-        }
-
-        // Determine target model based on GPU availability
-        let target_model = if egpu_available {
-            &tiers.egpu_available
-        } else {
-            &tiers.internal_only
-        };
-
-        info!(
-            "Model-Tier-Switch: {} (eGPU verfügbar: {})",
-            target_model, egpu_available
-        );
-
-        // Load is triggered implicitly by the next request to Ollama
-        // We just log the intent here; actual pre-loading would use /api/generate
-        // with a minimal prompt, but that's done by the applications themselves.
-
-        Ok(())
+        let instance = self
+            .instance_by_name(instance_name)
+            .ok_or_else(|| OllamaError::ApiError(format!("Instanz '{}' nicht gefunden", instance_name)))?;
+        instance.control.unload_model(model).await
     }
+
+    /// Gibt alle konfigurierten Instanzen zurück (auch nicht-verfügbare).
+    pub fn all_instances(&self) -> &[OllamaInstanceControl] {
+        &self.instances
+    }
+
 }
+
+use std::collections::HashMap;
 
 /// Mock Ollama control for testing.
 #[cfg(any(test, feature = "mock-hardware"))]
@@ -318,7 +284,6 @@ impl OllamaControl for MockOllamaControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egpu_manager_common::config::ModelTiers;
 
     #[tokio::test]
     async fn test_mock_ollama_list() {
@@ -374,77 +339,111 @@ mod tests {
         assert_eq!(vram, 8_000_000_000);
     }
 
-    #[tokio::test]
-    async fn test_model_tier_switch() {
-        let config = OllamaConfig {
-            enabled: true,
-            host: "http://localhost:11434".to_string(),
-            poll_interval_seconds: 5,
-            gpu_device: "0000:05:00.0".to_string(),
-            fallback_device: "0000:02:00.0".to_string(),
-            fallback_method: "helper-service".to_string(),
-            helper_service: String::new(),
-            gpu_target_file: String::new(),
-            priority: 1,
-            max_vram_mb: 14000,
-            auto_unload_idle_minutes: 10,
-            thermal_unload_temp_c: 75,
-            model_tiers: Some(ModelTiers {
-                egpu_available: "qwen3:14b".to_string(),
-                internal_only: "qwen3:8b".to_string(),
-                cpu_only: "qwen3:1.7b".to_string(),
-            }),
-        };
+    #[test]
+    fn test_fleet_workload_routing() {
+        use egpu_manager_common::config::OllamaInstanceConfig;
 
-        let ollama = MockOllamaControl::with_models(vec![OllamaModel {
-            name: "qwen3:14b".to_string(),
-            size_bytes: 14_000_000_000,
-            size_vram_bytes: 12_000_000_000,
-            expires_at: None,
-        }]);
+        let configs = vec![
+            OllamaInstanceConfig {
+                name: "ollama-egpu".to_string(),
+                host: "http://localhost:11434".to_string(),
+                gpu_device: "0000:05:00.0".to_string(),
+                models: vec!["qwen3:14b".to_string(), "nomic-embed-text".to_string()],
+                workload_types: vec!["llm".to_string(), "embeddings".to_string()],
+                priority: 1,
+                max_vram_mb: 14000,
+                auto_unload_idle_minutes: 10,
+                thermal_unload_temp_c: 75,
+            },
+            OllamaInstanceConfig {
+                name: "ollama-internal".to_string(),
+                host: "http://localhost:11435".to_string(),
+                gpu_device: "0000:02:00.0".to_string(),
+                models: vec!["qwen3:8b".to_string()],
+                workload_types: vec!["ocr-assist".to_string(), "staging".to_string()],
+                priority: 2,
+                max_vram_mb: 6000,
+                auto_unload_idle_minutes: 10,
+                thermal_unload_temp_c: 75,
+            },
+        ];
 
-        let manager = OllamaManager::new(config);
+        let fleet = OllamaFleet::new(configs, "0000:05:00.0");
+        assert_eq!(fleet.all_instances().len(), 2);
 
-        // Switch to internal-only tier (eGPU unavailable)
-        manager
-            .switch_model_tier(&ollama, false)
-            .await
-            .unwrap();
+        // LLM-Workload → ollama-egpu
+        let llm_instances = fleet.instances_for_workload("llm");
+        assert_eq!(llm_instances.len(), 1);
+        assert_eq!(llm_instances[0].config.name, "ollama-egpu");
 
-        // The old model should have been unloaded
-        let unloaded = ollama.unloaded.lock().await;
-        assert_eq!(unloaded.len(), 1);
-        assert_eq!(unloaded[0], "qwen3:14b");
+        // staging → ollama-internal
+        let staging_instances = fleet.instances_for_workload("staging");
+        assert_eq!(staging_instances.len(), 1);
+        assert_eq!(staging_instances[0].config.name, "ollama-internal");
+
+        // unbekannter Workload → keine Instanz
+        let unknown = fleet.instances_for_workload("unknown");
+        assert!(unknown.is_empty());
+
+        // Modell-Lookup
+        let qwen14b = fleet.instance_for_model("qwen3:14b");
+        assert!(qwen14b.is_some());
+        assert_eq!(qwen14b.unwrap().config.name, "ollama-egpu");
+
+        let qwen8b = fleet.instance_for_model("qwen3:8b");
+        assert!(qwen8b.is_some());
+        assert_eq!(qwen8b.unwrap().config.name, "ollama-internal");
     }
 
-    #[tokio::test]
-    async fn test_model_tier_switch_no_tiers() {
-        let config = OllamaConfig {
-            enabled: true,
-            host: "http://localhost:11434".to_string(),
-            poll_interval_seconds: 5,
-            gpu_device: "0000:05:00.0".to_string(),
-            fallback_device: "0000:02:00.0".to_string(),
-            fallback_method: "helper-service".to_string(),
-            helper_service: String::new(),
-            gpu_target_file: String::new(),
-            priority: 1,
-            max_vram_mb: 14000,
-            auto_unload_idle_minutes: 10,
-            thermal_unload_temp_c: 75,
-            model_tiers: None,
-        };
+    #[test]
+    fn test_fleet_gpu_unavailable() {
+        use egpu_manager_common::config::OllamaInstanceConfig;
+        use crate::scheduler::GpuTarget;
 
-        let ollama = MockOllamaControl::new();
-        let manager = OllamaManager::new(config);
+        let configs = vec![
+            OllamaInstanceConfig {
+                name: "ollama-egpu".to_string(),
+                host: "http://localhost:11434".to_string(),
+                gpu_device: "0000:05:00.0".to_string(),
+                models: vec!["qwen3:14b".to_string()],
+                workload_types: vec!["llm".to_string()],
+                priority: 1,
+                max_vram_mb: 14000,
+                auto_unload_idle_minutes: 10,
+                thermal_unload_temp_c: 75,
+            },
+            OllamaInstanceConfig {
+                name: "ollama-internal".to_string(),
+                host: "http://localhost:11435".to_string(),
+                gpu_device: "0000:02:00.0".to_string(),
+                models: vec!["qwen3:8b".to_string()],
+                workload_types: vec!["llm".to_string()],
+                priority: 2,
+                max_vram_mb: 6000,
+                auto_unload_idle_minutes: 10,
+                thermal_unload_temp_c: 75,
+            },
+        ];
 
-        // Should succeed without doing anything
-        manager
-            .switch_model_tier(&ollama, false)
-            .await
-            .unwrap();
+        let mut fleet = OllamaFleet::new(configs, "0000:05:00.0");
 
-        let unloaded = ollama.unloaded.lock().await;
-        assert!(unloaded.is_empty());
+        // Beide Instanzen verfügbar für LLM
+        assert_eq!(fleet.instances_for_workload("llm").len(), 2);
+
+        // eGPU offline
+        fleet.set_gpu_available(GpuTarget::Egpu, false);
+        let llm = fleet.instances_for_workload("llm");
+        assert_eq!(llm.len(), 1);
+        assert_eq!(llm[0].config.name, "ollama-internal");
+
+        // Modell auf eGPU nicht mehr findbar
+        assert!(fleet.instance_for_model("qwen3:14b").is_none());
+        // Modell auf interner GPU noch verfügbar
+        assert!(fleet.instance_for_model("qwen3:8b").is_some());
+
+        // eGPU wieder online
+        fleet.set_gpu_available(GpuTarget::Egpu, true);
+        assert_eq!(fleet.instances_for_workload("llm").len(), 2);
     }
+
 }

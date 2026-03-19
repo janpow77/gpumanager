@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use super::types::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse};
+use super::types::{ChatCompletionRequest, ChatCompletionResponse};
 
 /// Fehlertyp fuer Provider-Operationen
 #[derive(Debug, thiserror::Error)]
@@ -9,10 +9,6 @@ pub enum ProviderError {
     Http(#[from] reqwest::Error),
     #[error("API error: {status} {message}")]
     Api { status: u16, message: String },
-    #[error("Streaming error: {0}")]
-    Stream(String),
-    #[error("Configuration error: {0}")]
-    Config(String),
 }
 
 /// Trait fuer LLM-Provider
@@ -29,13 +25,6 @@ pub trait LlmProvider: Send + Sync {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, ProviderError>;
-
-    /// Streamenden Chat-Completion-Request senden
-    /// Gibt Chunks als Vec zurueck (vereinfacht; echtes Streaming via SSE in api.rs)
-    async fn chat_completion_stream(
-        &self,
-        request: &ChatCompletionRequest,
-    ) -> Result<Vec<ChatCompletionChunk>, ProviderError>;
 
     /// Health-Check
     async fn health_check(&self) -> bool;

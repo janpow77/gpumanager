@@ -11,7 +11,6 @@ use tokio_stream::StreamExt;
 /// Event types that can be broadcast via SSE.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data")]
-#[allow(dead_code)]
 pub enum BroadcastEvent {
     #[serde(rename = "gpu_status")]
     GpuStatus(serde_json::Value),
@@ -23,8 +22,6 @@ pub enum BroadcastEvent {
     PipelineChange(serde_json::Value),
     #[serde(rename = "config_reload")]
     ConfigReload(serde_json::Value),
-    #[serde(rename = "audit_action")]
-    AuditAction(serde_json::Value),
     #[serde(rename = "health_score")]
     HealthScore(serde_json::Value),
     /// eGPU Safe-Disconnect Warnung/Status fuer Widget/UI
@@ -40,7 +37,6 @@ impl BroadcastEvent {
             BroadcastEvent::RecoveryStage(_) => "recovery_stage",
             BroadcastEvent::PipelineChange(_) => "pipeline_change",
             BroadcastEvent::ConfigReload(_) => "config_reload",
-            BroadcastEvent::AuditAction(_) => "audit_action",
             BroadcastEvent::HealthScore(_) => "health_score",
             BroadcastEvent::EgpuDisconnect(_) => "egpu_disconnect",
         }
@@ -134,10 +130,6 @@ mod tests {
         assert_eq!(
             BroadcastEvent::ConfigReload(serde_json::Value::Null).event_type(),
             "config_reload"
-        );
-        assert_eq!(
-            BroadcastEvent::AuditAction(serde_json::Value::Null).event_type(),
-            "audit_action"
         );
         assert_eq!(
             BroadcastEvent::HealthScore(serde_json::Value::Null).event_type(),

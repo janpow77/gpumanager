@@ -3,7 +3,7 @@
 //! remote node registration task on a Windows machine.
 
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use std::net::IpAddr;
 use std::path::Path;
 
@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use egpu_manager_common::config::Config;
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
-use zip::{ZipArchive, ZipWriter};
+use zip::ZipWriter;
 
 const DEFAULT_REMOTE_OLLAMA_PORT: u16 = 11434;
 const DEFAULT_REMOTE_AGENT_PORT: u16 = 8899;
@@ -706,6 +706,8 @@ Write-Host "Verzeichnis $InstallDir kann manuell geloescht werden." -ForegroundC
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use zip::ZipArchive;
 
     fn make_test_config(token_path: &Path) -> Config {
         let config_str = format!(

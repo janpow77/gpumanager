@@ -81,26 +81,6 @@ impl GpuMonitorBackend {
         }
     }
 
-    pub fn validate_gpu_functional(
-        &self,
-        pci_address: &str,
-        expected_memory_mb: Option<u64>,
-    ) -> Result<bool, GpuError> {
-        match self {
-            GpuMonitorBackend::Nvml(m) => {
-                m.validate_gpu_functional(pci_address, expected_memory_mb)
-            }
-            GpuMonitorBackend::NvidiaSmi(_) => {
-                // Can't validate without NVML — assume OK
-                Ok(true)
-            }
-        }
-    }
-
-    /// Returns true if the backend is NVML.
-    pub fn is_nvml(&self) -> bool {
-        matches!(self, GpuMonitorBackend::Nvml(_))
-    }
 }
 
 // Keep backward-compatible type alias so monitor.rs compiles unchanged.
@@ -113,14 +93,12 @@ impl GpuMonitorBackend {
 
 pub struct NvmlGpuMonitor {
     nvml: Nvml,
-    #[allow(dead_code)]
-    timeout_secs: u64,
 }
 
 impl NvmlGpuMonitor {
-    pub fn new(timeout_secs: u64) -> Result<Self, GpuError> {
+    pub fn new(_timeout_secs: u64) -> Result<Self, GpuError> {
         let nvml = Nvml::init().map_err(|e| GpuError::NvmlError(format!("NVML init: {e}")))?;
-        Ok(Self { nvml, timeout_secs })
+        Ok(Self { nvml })
     }
 
     /// Query all GPUs via NVML.
@@ -311,47 +289,6 @@ impl NvmlGpuMonitor {
         self.nvml
             .sys_driver_version()
             .map_err(|e| GpuError::NvmlError(format!("sys_driver_version: {e}")))
-    }
-
-    /// Validate that a GPU is functional:
-    /// - memory_total matches expected (within 5% tolerance)
-    /// - temperature is sane (1..=110 °C)
-    pub fn validate_gpu_functional(
-        &self,
-        pci_address: &str,
-        expected_memory_mb: Option<u64>,
-    ) -> Result<bool, GpuError> {
-        let device = self.find_device_by_pci(pci_address)?;
-
-        // Temperature check
-        let temp = device
-            .temperature(TemperatureSensor::Gpu)
-            .unwrap_or(0);
-        if temp == 0 || temp > 110 {
-            debug!(
-                "GPU {pci_address} Temperatur außerhalb saner Grenzen: {temp}°C"
-            );
-            return Ok(false);
-        }
-
-        // Memory total check
-        if let Some(expected) = expected_memory_mb {
-            let memory_info = device
-                .memory_info()
-                .map_err(|e| GpuError::NvmlError(format!("memory_info: {e}")))?;
-            let actual_mb = memory_info.total / (1024 * 1024);
-            let tolerance = expected / 20; // 5%
-            if actual_mb < expected.saturating_sub(tolerance)
-                || actual_mb > expected + tolerance
-            {
-                debug!(
-                    "GPU {pci_address} Speicher-Mismatch: erwartet ~{expected} MB, gefunden {actual_mb} MB"
-                );
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────
@@ -580,42 +517,6 @@ pub fn normalize_pci_address(addr: &str) -> String {
         }
     }
     addr
-}
-
-/// Validate that a PCI address has the expected DDDD:BB:DD.F format.
-pub fn validate_pci_address(addr: &str) -> bool {
-    let normalized = normalize_pci_address(addr);
-    // Expected format: DDDD:BB:DD.F = 12 chars
-    if normalized.len() != 12 {
-        return false;
-    }
-    let parts: Vec<&str> = normalized.split(':').collect();
-    if parts.len() != 3 {
-        return false;
-    }
-    // Check that function part contains a dot
-    if !parts[2].contains('.') {
-        return false;
-    }
-    // Check all chars are hex digits (except separators)
-    let hex_check = |s: &str| s.chars().all(|c| c.is_ascii_hexdigit());
-    if !hex_check(parts[0]) || parts[0].len() != 4 {
-        return false;
-    }
-    if !hex_check(parts[1]) || parts[1].len() != 2 {
-        return false;
-    }
-    let func_parts: Vec<&str> = parts[2].split('.').collect();
-    if func_parts.len() != 2 {
-        return false;
-    }
-    if !hex_check(func_parts[0]) || func_parts[0].len() != 2 {
-        return false;
-    }
-    if !hex_check(func_parts[1]) || func_parts[1].len() != 1 {
-        return false;
-    }
-    true
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -867,11 +768,9 @@ mod tests {
         match &backend {
             GpuMonitorBackend::Nvml(_) => {
                 // NVML available — that's fine
-                assert!(backend.is_nvml());
             }
             GpuMonitorBackend::NvidiaSmi(_) => {
                 // Fallback — also fine
-                assert!(!backend.is_nvml());
             }
         }
     }
@@ -885,41 +784,11 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_gpu_functional_without_nvml() {
-        // nvidia-smi backend always returns Ok(true)
-        let backend = GpuMonitorBackend::NvidiaSmi(NvidiaSmiMonitor::new(5));
-        let result = backend.validate_gpu_functional("0000:02:00.0", Some(8192));
-        assert_eq!(result.unwrap(), true);
-    }
-
-    #[test]
     fn test_compute_processes_without_nvml() {
         // nvidia-smi backend returns empty vec
         let backend = GpuMonitorBackend::NvidiaSmi(NvidiaSmiMonitor::new(5));
         let result = backend.query_compute_processes("0000:02:00.0");
         assert!(result.unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_validate_pci_address_valid() {
-        assert!(validate_pci_address("0000:02:00.0"));
-        assert!(validate_pci_address("0000:05:00.0"));
-        assert!(validate_pci_address("0000:ff:1a.3"));
-    }
-
-    #[test]
-    fn test_validate_pci_address_normalizes_long_domain() {
-        // 8-digit domain should normalize and still validate
-        assert!(validate_pci_address("00000000:02:00.0"));
-    }
-
-    #[test]
-    fn test_validate_pci_address_invalid() {
-        assert!(!validate_pci_address(""));
-        assert!(!validate_pci_address("02:00.0"));
-        assert!(!validate_pci_address("0000:02:000")); // no dot
-        assert!(!validate_pci_address("ZZZZ:02:00.0")); // non-hex
-        assert!(!validate_pci_address("0000:GG:00.0")); // non-hex
     }
 
     #[test]

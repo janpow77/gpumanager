@@ -1,3 +1,7 @@
+// GTK-Widget deserialisiert JSON-Felder die nicht alle im UI angezeigt werden.
+// Das ist by-design (forward-compatible mit neuen API-Feldern).
+#![allow(dead_code)]
+
 use serde::Deserialize;
 
 /// Connection state to the daemon.

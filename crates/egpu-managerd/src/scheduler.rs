@@ -70,7 +70,6 @@ pub struct ScheduleRequest {
 
 /// Result of a scheduling attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ScheduleResult {
     /// Assigned to the requested GPU
     Assigned(GpuTarget),
@@ -81,8 +80,6 @@ pub enum ScheduleResult {
     },
     /// Queued because no capacity available
     Queued,
-    /// Rejected: eGPU blocked by warning level
-    BlockedByWarning,
 }
 
 /// GPU capacity information.
@@ -96,6 +93,18 @@ impl GpuCapacity {
     pub fn available_vram_mb(&self) -> u64 {
         self.total_vram_mb.saturating_sub(self.display_reserve_mb)
     }
+}
+
+/// Ein geladenes Ollama-Modell als VRAM-Verbraucher im Scheduler.
+#[derive(Debug, Clone)]
+pub struct ModelAssignment {
+    pub model_name: String,
+    pub instance_name: String,
+    pub target: GpuTarget,
+    pub vram_mb: u64,
+    pub priority: u32,
+    pub last_used: std::time::Instant,
+    pub workload_type: String,
 }
 
 /// The VRAM scheduler.
@@ -121,6 +130,8 @@ pub struct VramScheduler {
     egpu_available: bool,
     /// Manual eGPU admission state (set via API).
     admission_state: AdmissionState,
+    /// Geladene Ollama-Modelle als VRAM-Verbraucher (Key: (model_name, instance_name)).
+    model_assignments: HashMap<(String, String), ModelAssignment>,
 }
 
 impl VramScheduler {
@@ -140,10 +151,10 @@ impl VramScheduler {
             compute_utilization: HashMap::new(),
             egpu_available: true,
             admission_state: AdmissionState::Open,
+            model_assignments: HashMap::new(),
         }
     }
 
-    #[allow(dead_code)]
     pub fn set_egpu_available(&mut self, available: bool) {
         self.egpu_available = available;
         if !available {
@@ -267,6 +278,91 @@ impl VramScheduler {
             .sum()
     }
 
+    // ─── Model-Tracking ────────────────────────────────────────────────
+
+    /// Registriert ein geladenes Ollama-Modell als VRAM-Verbraucher.
+    pub fn register_model(&mut self, assignment: ModelAssignment) {
+        let key = (assignment.model_name.clone(), assignment.instance_name.clone());
+        debug!(
+            "Modell registriert: {} auf {} ({} MB VRAM, GPU {:?})",
+            assignment.model_name, assignment.instance_name, assignment.vram_mb, assignment.target
+        );
+        self.model_assignments.insert(key, assignment);
+    }
+
+    /// Entfernt ein Modell-Assignment.
+    pub fn unregister_model(&mut self, model: &str, instance: &str) -> Option<ModelAssignment> {
+        let key = (model.to_string(), instance.to_string());
+        let removed = self.model_assignments.remove(&key);
+        if removed.is_some() {
+            debug!("Modell entfernt: {} auf {}", model, instance);
+        }
+        removed
+    }
+
+    /// Gibt alle geladenen Modelle zurück.
+    pub fn loaded_models(&self) -> &HashMap<(String, String), ModelAssignment> {
+        &self.model_assignments
+    }
+
+    /// Gibt Modelle auf einer bestimmten GPU zurück, sortiert nach Priorität (niedrigste zuerst).
+    #[cfg(test)]
+    pub fn models_on_gpu(&self, target: GpuTarget) -> Vec<&ModelAssignment> {
+        let mut result: Vec<_> = self
+            .model_assignments
+            .values()
+            .filter(|m| m.target == target)
+            .collect();
+        // Sortiert: höchste Prioritätszahl = niedrigste Wichtigkeit = zuerst entladen
+        result.sort_by(|a, b| b.priority.cmp(&a.priority));
+        result
+    }
+
+    /// Findet Modelle die entladen werden können um Platz zu schaffen.
+    /// Gibt Modelle zurück deren Priorität niedriger ist als `min_priority`.
+    pub fn find_preemptable_models(
+        &self,
+        target: GpuTarget,
+        needed_mb: u64,
+        min_priority: u32,
+    ) -> Vec<(String, String, u64)> {
+        let mut candidates: Vec<_> = self
+            .model_assignments
+            .values()
+            .filter(|m| m.target == target && m.priority > min_priority)
+            .collect();
+        // Niedrigste Wichtigkeit zuerst (höchste Prioritätszahl)
+        candidates.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then(a.last_used.cmp(&b.last_used))
+        });
+
+        let mut freed = 0u64;
+        let mut result = Vec::new();
+        for model in candidates {
+            if freed >= needed_mb {
+                break;
+            }
+            freed += model.vram_mb;
+            result.push((
+                model.model_name.clone(),
+                model.instance_name.clone(),
+                model.vram_mb,
+            ));
+        }
+        result
+    }
+
+    /// VRAM die von Modellen auf einer GPU belegt wird.
+    pub fn model_vram_used(&self, target: GpuTarget) -> u64 {
+        self.model_assignments
+            .values()
+            .filter(|m| m.target == target)
+            .map(|m| m.vram_mb)
+            .sum()
+    }
+
     /// Get pipelines assigned to a specific GPU, sorted by priority (highest first).
     pub fn pipelines_on_gpu(&self, target: GpuTarget) -> Vec<&PipelineAssignment> {
         let mut result: Vec<_> = self
@@ -293,7 +389,7 @@ impl VramScheduler {
             })
             .sum();
 
-        assigned_vram + self.reserved_vram(target)
+        assigned_vram + self.reserved_vram(target) + self.model_vram_used(target)
     }
 
     /// Available VRAM on a GPU.
@@ -339,7 +435,7 @@ impl VramScheduler {
     }
 
     /// Remove a pipeline from assignments.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn remove(&mut self, name: &str) -> Option<PipelineAssignment> {
         let removed = self.assignments.remove(name);
         if removed.is_some() {
@@ -417,28 +513,6 @@ impl VramScheduler {
     /// Get the current queue.
     pub fn queue(&self) -> &VecDeque<ScheduleRequest> {
         &self.queue
-    }
-
-    /// Update a pipeline's current workload type and VRAM from a webhook.
-    #[allow(dead_code)]
-    pub fn update_workload(
-        &mut self,
-        pipeline: &str,
-        workload_type: &str,
-        vram_mb: u64,
-        gpu_active: bool,
-    ) -> bool {
-        if let Some(assignment) = self.assignments.get_mut(pipeline) {
-            assignment.actual_vram_mb = vram_mb;
-            debug!(
-                "Workload-Update: {} — Typ: {}, VRAM: {} MB, GPU aktiv: {}",
-                pipeline, workload_type, vram_mb, gpu_active
-            );
-            true
-        } else {
-            warn!("Workload-Update für unbekannte Pipeline: {}", pipeline);
-            false
-        }
     }
 
     /// Prueft ob eGPU fuer eine gegebene Prioritaet gesperrt ist.
@@ -628,6 +702,7 @@ impl VramScheduler {
 
     /// Return eGPU pipelines sorted by priority descending (lowest priority first to shed).
     /// Used by pressure reduction to find candidates for shedding load.
+    #[cfg(test)]
     pub fn pressure_reduction_candidates(&self) -> Vec<&PipelineAssignment> {
         let mut candidates: Vec<_> = self
             .assignments
@@ -640,6 +715,7 @@ impl VramScheduler {
     }
 
     /// Atomically schedule multiple requests. If any fails, rollback all.
+    #[cfg(test)]
     pub fn schedule_multi_gpu(&mut self, requests: Vec<ScheduleRequest>) -> Result<Vec<ScheduleResult>, String> {
         let snapshot_assignments = self.assignments.clone();
         let snapshot_leases = self.lease_reservations.clone();
@@ -660,7 +736,7 @@ impl VramScheduler {
         Ok(results)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn try_dequeue(&mut self) {
         // Try to assign queued requests
         let mut retry = Vec::new();
@@ -1180,6 +1256,120 @@ mod tests {
         assert!(result.is_err());
         // Verify rollback: multi_a should NOT be assigned
         assert!(!sched.assignments().contains_key("multi_a"));
+    }
+
+    #[test]
+    fn test_model_assignment_vram_accounting() {
+        let mut sched = make_scheduler();
+
+        // Modell registrieren: 10 GB auf eGPU
+        sched.register_model(ModelAssignment {
+            model_name: "qwen3:14b".to_string(),
+            instance_name: "ollama-egpu".to_string(),
+            target: GpuTarget::Egpu,
+            vram_mb: 10000,
+            priority: 1,
+            last_used: std::time::Instant::now(),
+            workload_type: "llm".to_string(),
+        });
+
+        // VRAM-Verbrauch sollte das Modell enthalten
+        assert_eq!(sched.vram_used(GpuTarget::Egpu), 10000);
+        assert_eq!(sched.vram_available(GpuTarget::Egpu), 6000);
+
+        // model_vram_used separat prüfbar
+        assert_eq!(sched.model_vram_used(GpuTarget::Egpu), 10000);
+        assert_eq!(sched.model_vram_used(GpuTarget::Internal), 0);
+
+        // Modell entfernen
+        let removed = sched.unregister_model("qwen3:14b", "ollama-egpu");
+        assert!(removed.is_some());
+        assert_eq!(sched.vram_used(GpuTarget::Egpu), 0);
+    }
+
+    #[test]
+    fn test_model_preemption_by_priority() {
+        let mut sched = make_scheduler();
+
+        // Niedrig-priores Modell (Prio 5) auf eGPU
+        sched.register_model(ModelAssignment {
+            model_name: "staging-model".to_string(),
+            instance_name: "ollama-egpu".to_string(),
+            target: GpuTarget::Egpu,
+            vram_mb: 6000,
+            priority: 5,
+            last_used: std::time::Instant::now(),
+            workload_type: "staging".to_string(),
+        });
+
+        // Hoch-priores Modell (Prio 1) auf eGPU
+        sched.register_model(ModelAssignment {
+            model_name: "qwen3:14b".to_string(),
+            instance_name: "ollama-egpu".to_string(),
+            target: GpuTarget::Egpu,
+            vram_mb: 10000,
+            priority: 1,
+            last_used: std::time::Instant::now(),
+            workload_type: "llm".to_string(),
+        });
+
+        // Suche preemptable Modelle für ein Prio-2-Request: nur Prio 5 darf raus
+        let preemptable = sched.find_preemptable_models(GpuTarget::Egpu, 5000, 2);
+        assert_eq!(preemptable.len(), 1);
+        assert_eq!(preemptable[0].0, "staging-model");
+        assert_eq!(preemptable[0].2, 6000);
+    }
+
+    #[test]
+    fn test_no_preempt_higher_priority_model() {
+        let mut sched = make_scheduler();
+
+        // Hoch-priores Modell (Prio 1)
+        sched.register_model(ModelAssignment {
+            model_name: "qwen3:14b".to_string(),
+            instance_name: "ollama-egpu".to_string(),
+            target: GpuTarget::Egpu,
+            vram_mb: 10000,
+            priority: 1,
+            last_used: std::time::Instant::now(),
+            workload_type: "llm".to_string(),
+        });
+
+        // Niedrig-priorer Request (Prio 3) kann Prio 1 nicht verdrängen
+        let preemptable = sched.find_preemptable_models(GpuTarget::Egpu, 5000, 3);
+        assert!(preemptable.is_empty());
+    }
+
+    #[test]
+    fn test_models_on_gpu() {
+        let mut sched = make_scheduler();
+
+        sched.register_model(ModelAssignment {
+            model_name: "model_a".to_string(),
+            instance_name: "inst_a".to_string(),
+            target: GpuTarget::Egpu,
+            vram_mb: 5000,
+            priority: 1,
+            last_used: std::time::Instant::now(),
+            workload_type: "llm".to_string(),
+        });
+        sched.register_model(ModelAssignment {
+            model_name: "model_b".to_string(),
+            instance_name: "inst_a".to_string(),
+            target: GpuTarget::Internal,
+            vram_mb: 3000,
+            priority: 2,
+            last_used: std::time::Instant::now(),
+            workload_type: "staging".to_string(),
+        });
+
+        let on_egpu = sched.models_on_gpu(GpuTarget::Egpu);
+        assert_eq!(on_egpu.len(), 1);
+        assert_eq!(on_egpu[0].model_name, "model_a");
+
+        let on_internal = sched.models_on_gpu(GpuTarget::Internal);
+        assert_eq!(on_internal.len(), 1);
+        assert_eq!(on_internal[0].model_name, "model_b");
     }
 
     #[test]

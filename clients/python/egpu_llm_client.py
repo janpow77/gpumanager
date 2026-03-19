@@ -17,15 +17,28 @@ Usage:
     # Streaming
     for chunk in client.chat_stream("Erkläre mir das", model="qwen3:14b"):
         print(chunk, end="", flush=True)
+
+    # Embeddings via Gateway (GPU-aware routing)
+    embeddings = client.embed("Testtext für Embedding")
+
+    # Staging für Bulk-Operationen (VRAM reservieren)
+    lease = client.staging_start("embeddings", vram_mb=4000, duration_s=7200)
+    # ... Bulk-Arbeit ...
+    client.staging_end(lease["lease_id"])
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
+import threading
 from typing import Any, Generator, Optional
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 class EgpuLlmClient:
@@ -73,6 +86,7 @@ class EgpuLlmClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         provider: str | None = None,
+        workload_type: str | None = None,
     ) -> dict[str, Any]:
         """Send a chat completion request.
 
@@ -84,6 +98,7 @@ class EgpuLlmClient:
             temperature: Sampling temperature
             max_tokens: Maximum tokens to generate
             provider: Force a specific provider
+            workload_type: Workload hint for GPU routing (e.g. "llm", "ocr")
 
         Returns:
             OpenAI-compatible response dict
@@ -109,6 +124,8 @@ class EgpuLlmClient:
             body["max_tokens"] = max_tokens
         if provider is not None:
             body["provider"] = provider
+        if workload_type is not None:
+            body["workload_type"] = workload_type
 
         resp = self._session.post(
             f"{self.gateway_url}/api/llm/chat/completions",
@@ -136,6 +153,7 @@ class EgpuLlmClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         provider: str | None = None,
+        workload_type: str | None = None,
     ) -> Generator[str, None, None]:
         """Send a streaming chat completion request.
 
@@ -158,6 +176,8 @@ class EgpuLlmClient:
             body["max_tokens"] = max_tokens
         if provider is not None:
             body["provider"] = provider
+        if workload_type is not None:
+            body["workload_type"] = workload_type
 
         resp = self._session.post(
             f"{self.gateway_url}/api/llm/chat/completions",
@@ -189,6 +209,151 @@ class EgpuLlmClient:
                         yield content
                 except (json.JSONDecodeError, IndexError, KeyError):
                     continue
+
+    def embed(
+        self,
+        input: str | list[str],
+        *,
+        model: str = "auto",
+    ) -> dict[str, Any] | None:
+        """Generate embeddings via the Gateway's embedding proxy.
+
+        The Gateway routes to the optimal Ollama instance with GPU awareness.
+        Model "auto" resolves to the app's configured embedding model
+        (e.g. nomic-embed-text for audit_designer).
+
+        ACHTUNG: nomic-embed-text (768d) und paraphrase-multilingual-mpnet-base-v2
+        (768d) haben identische Dimensionen aber verschiedene Vektorräume.
+        Bei Provider-Wechsel muss komplett neu-embedded werden!
+
+        Args:
+            input: Text or list of texts to embed
+            model: Model name ("auto" = app-configured default)
+
+        Returns:
+            OpenAI-compatible embedding response dict, or None on connection error
+        """
+        body: dict[str, Any] = {
+            "model": model,
+            "input": input,
+        }
+
+        try:
+            resp = self._session.post(
+                f"{self.gateway_url}/api/llm/embeddings",
+                json=body,
+                timeout=self.timeout,
+            )
+        except requests.ConnectionError:
+            logger.warning("eGPU Gateway nicht erreichbar für Embedding-Request")
+            return None
+
+        if resp.status_code != 200:
+            try:
+                data = resp.json()
+                raise EgpuGatewayError(
+                    status=resp.status_code,
+                    error_type=data.get("error", {}).get("type", "unknown"),
+                    message=data.get("error", {}).get("message", resp.text),
+                )
+            except (ValueError, KeyError):
+                raise EgpuGatewayError(
+                    status=resp.status_code,
+                    error_type="unknown",
+                    message=resp.text,
+                )
+
+        return resp.json()
+
+    def staging_start(
+        self,
+        workload_type: str,
+        *,
+        vram_mb: int = 4000,
+        duration_s: int = 7200,
+        description: str = "",
+    ) -> dict[str, Any] | None:
+        """Reserve VRAM via staging endpoint for bulk operations.
+
+        Use this before long-running jobs (e.g. re-embedding 50k documents)
+        to ensure GPU capacity is reserved and other workloads are preempted.
+
+        Args:
+            workload_type: Type of workload ("embeddings", "llm", "ocr")
+            vram_mb: Required VRAM in MB
+            duration_s: Expected duration in seconds
+            description: Human-readable job description
+
+        Returns:
+            Staging response with lease_id, ollama_host, model — or None on error
+        """
+        body: dict[str, Any] = {
+            "workload_type": workload_type,
+            "vram_mb": vram_mb,
+            "duration_seconds": duration_s,
+            "description": description,
+        }
+
+        try:
+            resp = self._session.post(
+                f"{self.gateway_url}/api/llm/staging",
+                json=body,
+                timeout=10,
+            )
+        except requests.ConnectionError:
+            logger.warning("eGPU Gateway nicht erreichbar für Staging-Request")
+            return None
+
+        if resp.status_code != 200:
+            logger.warning(
+                "Staging-Request fehlgeschlagen: %s %s",
+                resp.status_code, resp.text[:200],
+            )
+            return None
+
+        return resp.json()
+
+    def staging_end(self, lease_id: str) -> bool:
+        """Release a staging reservation.
+
+        Args:
+            lease_id: The lease_id from staging_start()
+
+        Returns:
+            True if successfully released
+        """
+        try:
+            resp = self._session.post(
+                f"{self.gateway_url}/api/gpu/release",
+                json={"lease_id": lease_id, "success": True},
+                timeout=5,
+            )
+            return resp.status_code == 200
+        except requests.ConnectionError:
+            logger.warning("eGPU Gateway nicht erreichbar für Release")
+            return False
+
+    def heartbeat(self, lease_id: str) -> bool:
+        """Send heartbeat for a long-running staging lease.
+
+        Prevents lease timeout for bulk jobs >2h. Call periodically
+        (e.g. every 10 minutes) during long operations.
+
+        Args:
+            lease_id: The lease_id from staging_start()
+
+        Returns:
+            True if heartbeat acknowledged
+        """
+        try:
+            resp = self._session.post(
+                f"{self.gateway_url}/api/gpu/heartbeat",
+                json={"lease_id": lease_id},
+                timeout=5,
+            )
+            return resp.status_code == 200
+        except requests.ConnectionError:
+            return False
 
     def get_providers(self) -> list[dict[str, Any]]:
         """Get list of available LLM providers."""

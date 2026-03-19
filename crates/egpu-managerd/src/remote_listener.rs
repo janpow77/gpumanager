@@ -484,6 +484,7 @@ mod tests {
             gpu_status: Vec::new(),
             pcie_throughput: HashMap::new(),
             ollama_models: Vec::new(),
+            ollama_models_by_instance: HashMap::new(),
             active_leases: HashMap::new(),
             recovery_active: false,
             remote_gpus: Vec::new(),

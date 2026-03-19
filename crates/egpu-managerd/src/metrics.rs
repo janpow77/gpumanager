@@ -19,14 +19,21 @@ pub struct GpuLabels {
     pub gpu: String,
 }
 
-/// Labels fuer Pipeline-Metriken.
+/// Labels fuer LLM Gateway-Metriken (pro App).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
-pub struct PipelineLabels {
-    pub pipeline: String,
-    pub gpu: String,
+pub struct GatewayLabels {
+    pub app_id: String,
+}
+
+/// Labels fuer LLM Gateway-Metriken (pro App + Provider).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
+pub struct GatewayProviderLabels {
+    pub app_id: String,
+    pub provider: String,
 }
 
 /// Alle Prometheus-Metriken des Daemons.
+#[allow(dead_code)] // PCIe-Throughput-Felder registriert aber noch nicht beschrieben
 pub struct DaemonMetrics {
     // GPU-Telemetrie (pro GPU)
     pub gpu_temperature_celsius: Family<GpuLabels, Gauge>,
@@ -62,6 +69,22 @@ pub struct DaemonMetrics {
 
     // Histogramm
     pub nvidia_query_duration_ms: Histogram,
+
+    // ─── LLM Gateway Metriken ────────────────────────────────────────
+    /// Chat-Completion-Requests pro App
+    pub gateway_chat_requests_total: Family<GatewayLabels, Counter>,
+    /// Embedding-Requests pro App
+    pub gateway_embedding_requests_total: Family<GatewayLabels, Counter>,
+    /// Gateway-Fehler pro App + Provider
+    pub gateway_errors_total: Family<GatewayProviderLabels, Counter>,
+    /// Aktive Staging-Leases
+    pub gateway_staging_leases_active: Gauge,
+    /// Gateway Chat-Latenz in Millisekunden
+    pub gateway_chat_latency_ms: Histogram,
+    /// Gateway Embedding-Latenz in Millisekunden
+    pub gateway_embedding_latency_ms: Histogram,
+    /// Tokens verarbeitet pro App (Input + Output)
+    pub gateway_tokens_total: Family<GatewayLabels, Counter>,
 }
 
 use std::sync::atomic::AtomicU64;
@@ -232,6 +255,59 @@ impl DaemonMetrics {
             nvidia_query_duration_ms.clone(),
         );
 
+        // ─── LLM Gateway Metriken ────────────────────────────────────────
+
+        let gateway_chat_requests_total = Family::<GatewayLabels, Counter>::default();
+        registry.register(
+            "egpu_gateway_chat_requests_total",
+            "Chat-Completion-Requests ueber das Gateway pro App",
+            gateway_chat_requests_total.clone(),
+        );
+
+        let gateway_embedding_requests_total = Family::<GatewayLabels, Counter>::default();
+        registry.register(
+            "egpu_gateway_embedding_requests_total",
+            "Embedding-Requests ueber das Gateway pro App",
+            gateway_embedding_requests_total.clone(),
+        );
+
+        let gateway_errors_total = Family::<GatewayProviderLabels, Counter>::default();
+        registry.register(
+            "egpu_gateway_errors_total",
+            "Gateway-Fehler pro App und Provider",
+            gateway_errors_total.clone(),
+        );
+
+        let gateway_staging_leases_active = Gauge::default();
+        registry.register(
+            "egpu_gateway_staging_leases_active",
+            "Anzahl aktiver Staging-Reservierungen",
+            gateway_staging_leases_active.clone(),
+        );
+
+        let gateway_chat_latency_ms =
+            Histogram::new(exponential_buckets(10.0, 2.0, 12));
+        registry.register(
+            "egpu_gateway_chat_latency_ms",
+            "Chat-Completion Latenz in Millisekunden",
+            gateway_chat_latency_ms.clone(),
+        );
+
+        let gateway_embedding_latency_ms =
+            Histogram::new(exponential_buckets(5.0, 2.0, 12));
+        registry.register(
+            "egpu_gateway_embedding_latency_ms",
+            "Embedding Latenz in Millisekunden",
+            gateway_embedding_latency_ms.clone(),
+        );
+
+        let gateway_tokens_total = Family::<GatewayLabels, Counter>::default();
+        registry.register(
+            "egpu_gateway_tokens_total",
+            "Tokens verarbeitet pro App (Input + Output)",
+            gateway_tokens_total.clone(),
+        );
+
         let metrics = Self {
             gpu_temperature_celsius,
             gpu_utilization_percent,
@@ -256,6 +332,13 @@ impl DaemonMetrics {
             xid_errors_total,
             recovery_stages_total,
             nvidia_query_duration_ms,
+            gateway_chat_requests_total,
+            gateway_embedding_requests_total,
+            gateway_errors_total,
+            gateway_staging_leases_active,
+            gateway_chat_latency_ms,
+            gateway_embedding_latency_ms,
+            gateway_tokens_total,
         };
 
         (metrics, registry)
@@ -284,6 +367,30 @@ impl DaemonMetrics {
     /// Warning-Level als Zahl (0=Green, 1=Yellow, 2=Orange, 3=Red).
     pub fn set_warning_level(&self, level: i64) {
         self.warning_level.set(level);
+    }
+
+    /// Gateway Chat-Request erfassen.
+    pub fn record_chat_request(&self, app_id: &str, latency_ms: f64, tokens: u64) {
+        let labels = GatewayLabels { app_id: app_id.to_string() };
+        self.gateway_chat_requests_total.get_or_create(&labels).inc();
+        self.gateway_chat_latency_ms.observe(latency_ms);
+        self.gateway_tokens_total.get_or_create(&labels).inc_by(tokens);
+    }
+
+    /// Gateway Embedding-Request erfassen.
+    pub fn record_embedding_request(&self, app_id: &str, latency_ms: f64) {
+        let labels = GatewayLabels { app_id: app_id.to_string() };
+        self.gateway_embedding_requests_total.get_or_create(&labels).inc();
+        self.gateway_embedding_latency_ms.observe(latency_ms);
+    }
+
+    /// Gateway-Fehler erfassen.
+    pub fn record_gateway_error(&self, app_id: &str, provider: &str) {
+        let labels = GatewayProviderLabels {
+            app_id: app_id.to_string(),
+            provider: provider.to_string(),
+        };
+        self.gateway_errors_total.get_or_create(&labels).inc();
     }
 }
 
@@ -347,5 +454,35 @@ mod tests {
         let (metrics, _state) = create_metrics();
         metrics.nvidia_query_duration_ms.observe(42.5);
         metrics.nvidia_query_duration_ms.observe(150.0);
+    }
+
+    #[test]
+    fn test_gateway_metrics() {
+        let (metrics, state) = create_metrics();
+
+        // Chat-Request simulieren
+        metrics.record_chat_request("audit_designer", 250.0, 1500);
+        metrics.record_chat_request("audit_designer", 180.0, 800);
+        metrics.record_chat_request("flowinvoice", 300.0, 2000);
+
+        // Embedding-Request simulieren
+        metrics.record_embedding_request("audit_designer", 45.0);
+
+        // Fehler simulieren
+        metrics.record_gateway_error("flowinvoice", "ollama-egpu");
+
+        // Staging
+        metrics.gateway_staging_leases_active.set(2);
+
+        let state_lock = state.blocking_lock();
+        let output = state_lock.encode();
+        assert!(output.contains("egpu_gateway_chat_requests_total"));
+        assert!(output.contains("egpu_gateway_embedding_requests_total"));
+        assert!(output.contains("egpu_gateway_errors_total"));
+        assert!(output.contains("egpu_gateway_staging_leases_active"));
+        assert!(output.contains("egpu_gateway_chat_latency_ms"));
+        assert!(output.contains("egpu_gateway_tokens_total"));
+        assert!(output.contains("audit_designer"));
+        assert!(output.contains("flowinvoice"));
     }
 }

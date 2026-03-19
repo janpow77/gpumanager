@@ -22,6 +22,9 @@ pub struct ChatCompletionRequest {
     /// Provider override (client can request specific provider)
     #[serde(default)]
     pub provider: Option<String>,
+    /// Workload-Typ für GPU-Aware Routing (z.B. "embeddings", "llm", "ocr")
+    #[serde(default)]
+    pub workload_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,31 +59,6 @@ pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
-}
-
-/// Streaming chunk (SSE format)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatCompletionChunk {
-    pub id: String,
-    pub object: String,
-    pub created: i64,
-    pub model: String,
-    pub choices: Vec<ChunkChoice>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkChoice {
-    pub index: u32,
-    pub delta: ChunkDelta,
-    pub finish_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkDelta {
-    #[serde(default)]
-    pub role: Option<String>,
-    #[serde(default)]
-    pub content: Option<String>,
 }
 
 /// Provider status info
@@ -158,4 +136,35 @@ impl GatewayError {
             "permission_error",
         )
     }
+}
+
+/// Embedding-Request (Ollama /api/embed kompatibel)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    pub input: EmbeddingInput,
+    /// Workload-Typ für GPU-Aware Routing
+    #[serde(default)]
+    pub workload_type: Option<String>,
+}
+
+/// Embedding-Input: einzelner String oder Liste
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+/// Embedding-Response (Ollama /api/embed kompatibel)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingResponse {
+    pub model: String,
+    pub embeddings: Vec<Vec<f64>>,
+    #[serde(default)]
+    pub total_duration: Option<u64>,
+    #[serde(default)]
+    pub load_duration: Option<u64>,
+    #[serde(default)]
+    pub prompt_eval_count: Option<u32>,
 }

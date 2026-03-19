@@ -59,6 +59,9 @@ pub struct WorkloadUpdateBody {
 #[derive(Debug, Deserialize)]
 pub struct UnloadModelBody {
     pub model: String,
+    /// Optionale Ollama-Instanz (Fleet-Modus). Ohne: Legacy-Verhalten.
+    #[serde(default)]
+    pub instance: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +144,8 @@ pub struct StatusResponse {
     pub gpus: Vec<GpuInfo>,
     pub remote_gpus: Vec<RemoteGpuInfo>,
     pub health_score: HealthScoreInfo,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ollama_instances: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -324,11 +329,34 @@ pub async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
             .unwrap_or_default(),
     };
 
+    // Ollama-Instanzen (Fleet-Modus)
+    let ollama_instances: Vec<serde_json::Value> = cfg
+        .resolve_ollama_instances()
+        .iter()
+        .map(|inst| {
+            let models: Vec<serde_json::Value> = monitor_state
+                .ollama_models_by_instance
+                .get(&inst.name)
+                .unwrap_or(&Vec::new())
+                .iter()
+                .map(|m| serde_json::json!({ "name": m.name, "vram_mb": m.size_vram_bytes / 1024 / 1024 }))
+                .collect();
+            serde_json::json!({
+                "name": inst.name,
+                "host": inst.host,
+                "gpu_device": inst.gpu_device,
+                "models_loaded": models,
+                "workload_types": inst.workload_types,
+            })
+        })
+        .collect();
+
     Json(StatusResponse {
         daemon,
         gpus,
         remote_gpus,
         health_score,
+        ollama_instances,
     })
 }
 
@@ -743,6 +771,21 @@ pub async fn post_gpu_acquire(
                 .await
                 .ok();
 
+            // Lease in SQLite persistieren (überlebt Daemon-Restart)
+            state
+                .db
+                .save_lease(
+                    &lease.lease_id,
+                    &body.pipeline,
+                    &lease.gpu_device,
+                    &body.workload_type,
+                    body.vram_mb,
+                    &chrono::Utc::now(),
+                    &lease.expires_at,
+                )
+                .await
+                .ok();
+
             Json(serde_json::json!({
                 "granted": true,
                 "gpu_device": lease.gpu_device,
@@ -954,6 +997,9 @@ pub async fn post_gpu_release(
         // Drop the lock before logging
         drop(monitor_state);
 
+        // Lease aus SQLite entfernen
+        state.db.remove_lease(&body.lease_id).await.ok();
+
         state
             .db
             .log_event(
@@ -1008,6 +1054,9 @@ pub async fn post_gpu_heartbeat(
     let mut st = state.monitor_state.lock().await;
     if let Some(lease) = st.active_leases.get_mut(&body.lease_id) {
         lease.last_heartbeat = Utc::now();
+        drop(st);
+        // Heartbeat in SQLite aktualisieren
+        state.db.update_lease_heartbeat(&body.lease_id).await.ok();
         (
             StatusCode::OK,
             Json(serde_json::json!({"status": "ok", "lease_id": body.lease_id})),
@@ -1037,12 +1086,20 @@ pub async fn get_gpu_recommend(
         query.vram_mb,
     );
 
-    // Get Ollama host if configured
-    let ollama_host = cfg
-        .ollama
-        .as_ref()
-        .filter(|o| o.enabled)
-        .map(|o| o.host.clone());
+    // Get Ollama host(s): Fleet-Modus liefert passende Instanz, Legacy den einzigen Host
+    let (ollama_host, ollama_instance_name) = if let Some(ref fleet) = state.ollama_fleet {
+        let wt = query.workload_type.as_deref().unwrap_or("llm");
+        let inst = fleet.instances_for_workload(wt).into_iter().next();
+        (
+            inst.map(|i| i.config.host.clone()),
+            inst.map(|i| i.config.name.clone()),
+        )
+    } else {
+        (
+            cfg.ollama.as_ref().filter(|o| o.enabled).map(|o| o.host.clone()),
+            None,
+        )
+    };
 
     Json(serde_json::json!({
         "recommended_gpu": recommendation.recommended_gpu,
@@ -1061,6 +1118,7 @@ pub async fn get_gpu_recommend(
         "internal_vram_available_mb": recommendation.internal_vram_available_mb,
         "remote_vram_available_mb": recommendation.remote_vram_available_mb,
         "ollama_host": ollama_host,
+        "ollama_instance": ollama_instance_name,
         "query": {
             "pipeline": query.pipeline,
             "workload_type": query.workload_type,
@@ -1139,6 +1197,45 @@ pub async fn post_egpu_admission(
 
 pub async fn get_ollama_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cfg = state.config.load();
+
+    // Fleet-Modus: Wenn ollama_instance konfiguriert, aggregierten Status liefern
+    let instances = cfg.resolve_ollama_instances();
+    if !instances.is_empty() {
+        let monitor_state = state.monitor_state.lock().await;
+        let all_models = monitor_state.all_ollama_models();
+        let total_vram: u64 = all_models.iter().map(|m| m.size_vram_bytes).sum();
+
+        let instance_summary: Vec<serde_json::Value> = instances
+            .iter()
+            .map(|inst| {
+                let models = monitor_state
+                    .ollama_models_by_instance
+                    .get(&inst.name)
+                    .cloned()
+                    .unwrap_or_default();
+                let inst_vram: u64 = models.iter().map(|m| m.size_vram_bytes).sum();
+                serde_json::json!({
+                    "name": inst.name,
+                    "host": inst.host,
+                    "models": models,
+                    "vram_bytes": inst_vram,
+                    "vram_mb": inst_vram / 1024 / 1024,
+                })
+            })
+            .collect();
+
+        return Json(serde_json::json!({
+            "enabled": true,
+            "fleet_mode": true,
+            "instances": instance_summary,
+            "models": all_models,
+            "total_vram_bytes": total_vram,
+            "total_vram_mb": total_vram / 1024 / 1024,
+        }))
+        .into_response();
+    }
+
+    // Legacy: Einzelinstanz-Modus
     let Some(ref ollama_cfg) = cfg.ollama else {
         return api_error(StatusCode::NOT_FOUND, "Ollama nicht konfiguriert").into_response();
     };
@@ -1151,7 +1248,6 @@ pub async fn get_ollama_status(State(state): State<Arc<AppState>>) -> impl IntoR
         .into_response();
     }
 
-    // Return cached Ollama models from MonitorState if available
     let monitor_state = state.monitor_state.lock().await;
     if !monitor_state.ollama_models.is_empty() {
         let total_vram: u64 = monitor_state
@@ -1161,6 +1257,7 @@ pub async fn get_ollama_status(State(state): State<Arc<AppState>>) -> impl IntoR
             .sum();
         return Json(serde_json::json!({
             "enabled": true,
+            "fleet_mode": false,
             "host": ollama_cfg.host,
             "models": monitor_state.ollama_models,
             "total_vram_bytes": total_vram,
@@ -1176,6 +1273,7 @@ pub async fn get_ollama_status(State(state): State<Arc<AppState>>) -> impl IntoR
             let total_vram: u64 = models.iter().map(|m| m.size_vram_bytes).sum();
             Json(serde_json::json!({
                 "enabled": true,
+                "fleet_mode": false,
                 "host": ollama_cfg.host,
                 "models": models,
                 "total_vram_bytes": total_vram,
@@ -1189,6 +1287,70 @@ pub async fn get_ollama_status(State(state): State<Arc<AppState>>) -> impl IntoR
         )
         .into_response(),
     }
+}
+
+// ─── GET /api/ollama/instances ────────────────────────────────────────────
+
+/// GET /api/ollama/instances — Alle konfigurierten Ollama-Instanzen mit Modell-Status
+pub async fn get_ollama_instances(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = state.config.load();
+    let instances = cfg.resolve_ollama_instances();
+
+    if instances.is_empty() {
+        return Json(serde_json::json!({ "instances": [] })).into_response();
+    }
+
+    let monitor_state = state.monitor_state.lock().await;
+    let mut result = Vec::new();
+
+    for inst_cfg in &instances {
+        let models_loaded: Vec<serde_json::Value> = monitor_state
+            .ollama_models_by_instance
+            .get(&inst_cfg.name)
+            .unwrap_or(&Vec::new())
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "name": m.name,
+                    "vram_mb": m.size_vram_bytes / 1024 / 1024,
+                })
+            })
+            .collect();
+
+        let vram_used_mb: u64 = monitor_state
+            .ollama_models_by_instance
+            .get(&inst_cfg.name)
+            .unwrap_or(&Vec::new())
+            .iter()
+            .map(|m| m.size_vram_bytes / 1024 / 1024)
+            .sum();
+
+        // GPU-Verfügbarkeit aus Scheduler ableiten
+        let gpu_target = if inst_cfg.gpu_device == cfg.gpu.egpu_pci_address {
+            GpuTarget::Egpu
+        } else {
+            GpuTarget::Internal
+        };
+        let available = match gpu_target {
+            GpuTarget::Egpu => monitor_state.scheduler.egpu_available(),
+            GpuTarget::Internal => true,
+        };
+
+        result.push(serde_json::json!({
+            "name": inst_cfg.name,
+            "host": inst_cfg.host,
+            "gpu_device": inst_cfg.gpu_device,
+            "available": available,
+            "models_loaded": models_loaded,
+            "models_configured": inst_cfg.models,
+            "workload_types": inst_cfg.workload_types,
+            "vram_used_mb": vram_used_mb,
+            "vram_max_mb": inst_cfg.max_vram_mb,
+            "priority": inst_cfg.priority,
+        }));
+    }
+
+    Json(serde_json::json!({ "instances": result })).into_response()
 }
 
 // ─── POST /api/ollama/unload ─────────────────────────────────────────────
@@ -1214,13 +1376,72 @@ pub async fn post_ollama_unload(
     if is_dry_run(&dry_run) {
         return Json(DryRunResponse {
             dry_run: true,
-            impact: format!("Modell '{}' wuerde entladen", body.model),
+            impact: format!(
+                "Modell '{}' wuerde entladen{}",
+                body.model,
+                body.instance
+                    .as_deref()
+                    .map(|i| format!(" (Instanz: {i})"))
+                    .unwrap_or_default()
+            ),
             would_affect: vec![body.model],
         })
         .into_response();
     }
 
-    // Unload via Ollama API (POST /api/generate with keep_alive=0)
+    // Fleet-Modus: Unload über OllamaFleet wenn Instanz angegeben
+    if let Some(ref instance_name) = body.instance {
+        if let Some(ref fleet) = state.ollama_fleet {
+            match fleet.unload_model_on(instance_name, &body.model).await {
+                Ok(()) => {
+                    // Scheduler-Assignment entfernen
+                    {
+                        let mut ms = state.monitor_state.lock().await;
+                        ms.scheduler.unregister_model(&body.model, instance_name);
+                    }
+
+                    state
+                        .db
+                        .log_event(
+                            "api.ollama_unload",
+                            Severity::Info,
+                            &format!(
+                                "Ollama-Modell '{}' auf Instanz '{}' entladen",
+                                body.model, instance_name
+                            ),
+                            Some(serde_json::json!({
+                                "model": body.model,
+                                "instance": instance_name,
+                            })),
+                        )
+                        .await
+                        .ok();
+
+                    return Json(serde_json::json!({
+                        "ok": true,
+                        "model": body.model,
+                        "instance": instance_name,
+                    }))
+                    .into_response();
+                }
+                Err(e) => {
+                    return api_error(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Unload fehlgeschlagen: {e}"),
+                    )
+                    .into_response();
+                }
+            }
+        } else {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "OllamaFleet nicht konfiguriert — 'instance' Parameter nicht nutzbar",
+            )
+            .into_response();
+        }
+    }
+
+    // Legacy: Unload via Ollama API (POST /api/generate with keep_alive=0)
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build();
@@ -1793,6 +2014,171 @@ pub async fn get_egpu_disconnect_status(
 
 // ─── LLM Gateway Endpoints ─────────────────────────────────────────────────
 
+// ─── POST /api/llm/staging — Bulk-Staging/Retagging mit VRAM-Reservierung ──
+
+#[derive(Debug, serde::Deserialize)]
+pub struct StagingRequest {
+    /// App-ID (wird auch aus X-App-Id Header gelesen)
+    #[serde(default)]
+    pub app_id: Option<String>,
+    /// Workload-Typ: "embeddings", "retagging", "staging"
+    pub workload_type: String,
+    /// Geschätzter VRAM-Bedarf in MB
+    #[serde(default = "default_staging_vram")]
+    pub vram_mb: u64,
+    /// Geschätzte Dauer in Sekunden
+    #[serde(default = "default_staging_duration")]
+    pub duration_seconds: u64,
+    /// Beschreibung der Bulk-Operation
+    #[serde(default)]
+    pub description: String,
+}
+
+fn default_staging_vram() -> u64 { 4000 }
+fn default_staging_duration() -> u64 { 7200 }
+
+/// POST /api/llm/staging — Reserviert GPU-Ressourcen für eine Bulk-Operation
+/// (Retagging, Embedding-Neuberechnung, etc.)
+///
+/// Gibt zurück:
+/// - `ollama_host`: Welche Ollama-Instanz zu nutzen ist
+/// - `model`: Welches Modell für den Workload
+/// - `lease_id`: VRAM-Reservierung (muss nach Abschluss freigegeben werden)
+/// - `gpu_device`: Auf welcher GPU die Operation läuft
+pub async fn post_llm_staging(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<StagingRequest>,
+) -> impl IntoResponse {
+    let app_id = body.app_id.clone().unwrap_or_else(|| {
+        headers.get("x-app-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string()
+    });
+
+    let cfg = state.config.load();
+
+    // Modell aus App-Config + Workload-Typ auflösen
+    let model = cfg.llm_gateway.as_ref()
+        .and_then(|gw| gw.app_routing.iter().find(|r| r.app_id == app_id))
+        .and_then(|r| r.workload_model_map.get(&body.workload_type))
+        .cloned()
+        .unwrap_or_else(|| "nomic-embed-text".to_string());
+
+    // Ollama-Host über Fleet auflösen
+    let (ollama_host, instance_name) = if let Some(ref fleet) = state.ollama_fleet {
+        if let Some(inst) = fleet.instance_for_model(&model) {
+            (inst.config.host.clone(), inst.config.name.clone())
+        } else if let Some(inst) = fleet.instances_for_workload(&body.workload_type).first() {
+            (inst.config.host.clone(), inst.config.name.clone())
+        } else {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Keine Ollama-Instanz für Workload '{}'", body.workload_type),
+            ).into_response();
+        }
+    } else if let Some(ref ollama_cfg) = cfg.ollama {
+        (ollama_cfg.host.clone(), "ollama".to_string())
+    } else {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "Ollama nicht konfiguriert").into_response();
+    };
+
+    // GPU-Lease reservieren
+    let result = crate::monitor::acquire_gpu_lease(
+        &state.monitor_state,
+        &cfg,
+        app_id.clone(),
+        body.workload_type.clone(),
+        body.vram_mb,
+        body.duration_seconds,
+    ).await;
+
+    match result {
+        Ok(lease) => {
+            state.db.log_event(
+                "api.llm_staging",
+                Severity::Info,
+                &format!(
+                    "Staging gestartet: {} ({}, {} MB VRAM, Modell: {})",
+                    body.description, app_id, body.vram_mb, model
+                ),
+                Some(serde_json::json!({
+                    "app_id": app_id,
+                    "workload_type": body.workload_type,
+                    "model": model,
+                    "lease_id": lease.lease_id,
+                    "vram_mb": body.vram_mb,
+                })),
+            ).await.ok();
+
+            Json(serde_json::json!({
+                "ok": true,
+                "lease_id": lease.lease_id,
+                "ollama_host": ollama_host,
+                "ollama_instance": instance_name,
+                "model": model,
+                "gpu_device": lease.gpu_device,
+                "target_kind": lease.target_kind,
+                "vram_mb": body.vram_mb,
+                "expires_at": lease.expires_at.to_rfc3339(),
+                "message": format!(
+                    "Staging reserviert: {} auf {} ({}). Lease nach Abschluss freigeben!",
+                    model, lease.gpu_device, instance_name,
+                ),
+            })).into_response()
+        }
+        Err(queue_pos) => {
+            Json(serde_json::json!({
+                "ok": false,
+                "queue_position": queue_pos,
+                "message": "Nicht genug VRAM. Bitte warten oder niedrig-priore Workloads stoppen.",
+                "suggestion": "POST /api/ollama/unload um Modelle manuell zu entladen",
+            })).into_response()
+        }
+    }
+}
+
+/// POST /api/llm/embeddings — Embedding-Proxy via LLM Gateway (Ollama /api/embed kompatibel)
+pub async fn post_llm_embeddings(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<crate::llm::types::EmbeddingRequest>,
+) -> impl IntoResponse {
+    let Some(ref router) = state.llm_router else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "LLM Gateway nicht konfiguriert",
+        )
+        .into_response();
+    };
+
+    let app_id = headers
+        .get("x-app-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+
+    let start = std::time::Instant::now();
+    match router.embed(request, app_id).await {
+        Ok(response) => {
+            if let Some(ref m) = state.daemon_metrics {
+                m.record_embedding_request(app_id, start.elapsed().as_millis() as f64);
+            }
+            Json(serde_json::to_value(response).unwrap()).into_response()
+        }
+        Err(err) => {
+            if let Some(ref m) = state.daemon_metrics {
+                m.record_gateway_error(app_id, &err.error.r#type);
+            }
+            let status = match err.error.r#type.as_str() {
+                "routing_error" => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            (status, Json(serde_json::to_value(err).unwrap())).into_response()
+        }
+    }
+}
+
 /// POST /api/llm/chat/completions — OpenAI-kompatible Chat-Completion via LLM Gateway
 pub async fn post_llm_chat_completions(
     State(state): State<Arc<AppState>>,
@@ -1812,9 +2198,24 @@ pub async fn post_llm_chat_completions(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
 
+    let start = std::time::Instant::now();
     match router.chat_completion(request, app_id).await {
-        Ok(response) => Json(serde_json::to_value(response).unwrap()).into_response(),
+        Ok(response) => {
+            // Gateway-Metriken erfassen
+            if let Some(ref m) = state.daemon_metrics {
+                let latency = start.elapsed().as_millis() as f64;
+                let tokens = response.usage.as_ref()
+                    .map(|u| (u.prompt_tokens + u.completion_tokens) as u64)
+                    .unwrap_or(0);
+                m.record_chat_request(app_id, latency, tokens);
+            }
+            Json(serde_json::to_value(response).unwrap()).into_response()
+        }
         Err(err) => {
+            // Gateway-Fehler-Metrik
+            if let Some(ref m) = state.daemon_metrics {
+                m.record_gateway_error(app_id, &err.error.r#type);
+            }
             let status = match err.error.r#type.as_str() {
                 "rate_limit_error" => StatusCode::TOO_MANY_REQUESTS,
                 "budget_exceeded" => StatusCode::PAYMENT_REQUIRED,
@@ -2023,6 +2424,16 @@ pub async fn get_discover(State(state): State<Arc<AppState>>) -> impl IntoRespon
         },
         "llm_gateway": {
             "active": llm_gateway_active,
+            "gpu_aware_routing": state.ollama_fleet.is_some(),
+            "ollama_instances": cfg.resolve_ollama_instances().iter().map(|i| {
+                serde_json::json!({
+                    "name": i.name,
+                    "host": i.host,
+                    "gpu_device": i.gpu_device,
+                    "workload_types": i.workload_types,
+                    "models": i.models,
+                })
+            }).collect::<Vec<_>>(),
             "note": if llm_gateway_active {
                 "LLM Gateway ist aktiv und nimmt Requests an"
             } else {
@@ -2070,8 +2481,9 @@ pub async fn get_discover(State(state): State<Arc<AppState>>) -> impl IntoRespon
                 "path": "/api/llm/chat/completions",
                 "description": "OpenAI-kompatible Chat Completion via LLM Gateway",
                 "headers": {"X-App-Id": "app_name"},
-                "body": {"model": "string", "messages": [{"role": "user", "content": "string"}]},
-                "compatible_with": "OpenAI Chat Completions API"
+                "body": {"model": "string", "messages": [{"role": "user", "content": "string"}], "workload_type": "optional: embeddings|llm|ocr|staging"},
+                "compatible_with": "OpenAI Chat Completions API",
+                "gpu_aware": "workload_type triggers automatic model+GPU selection per app config"
             },
             "llm_providers": {
                 "method": "GET",

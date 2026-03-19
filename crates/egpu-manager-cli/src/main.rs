@@ -58,6 +58,12 @@ enum PriorityAction {
 enum ConfigAction {
     /// Konfiguration neuladen
     Reload,
+    /// Konfigurationsdatei validieren (Schema, Pipelines, LLM Gateway)
+    Validate {
+        /// Pfad zur config.toml (default: /etc/egpu-manager/config.toml)
+        #[arg(short, long)]
+        path: Option<String>,
+    },
     /// Letztes Backup wiederherstellen
     Rollback {
         /// Zeitstempel des Backups (optional, sonst neuestes)
@@ -104,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Config { action } => match action {
             ConfigAction::Reload => cmd_config_reload().await?,
+            ConfigAction::Validate { path } => cmd_config_validate(path)?,
             ConfigAction::Rollback { timestamp } => cmd_config_rollback(timestamp).await?,
             ConfigAction::ListBackups => cmd_config_list_backups()?,
         },
@@ -319,6 +326,120 @@ async fn cmd_config_reload() -> anyhow::Result<()> {
         println!("Konfiguration neu geladen.");
     } else {
         eprintln!("Reload fehlgeschlagen.");
+    }
+
+    Ok(())
+}
+
+// ============================================================
+// Config: Validate
+// ============================================================
+
+fn cmd_config_validate(path: Option<String>) -> anyhow::Result<()> {
+    use egpu_manager_common::config::Config;
+
+    let config_path = path
+        .as_deref()
+        .unwrap_or(DEFAULT_CONFIG_PATH);
+
+    println!("Validiere: {config_path}");
+
+    // 1. Datei lesbar?
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  FEHLER: Datei nicht lesbar: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // 2. TOML-Syntax gültig?
+    let config: Config = match toml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  FEHLER: TOML-Parsing fehlgeschlagen:");
+            eprintln!("  {e}");
+            std::process::exit(1);
+        }
+    };
+
+    println!("  Schema v{} — OK", config.schema_version);
+
+    // 3. Pipelines prüfen
+    let mut warnings = Vec::new();
+    let mut info_msgs = Vec::new();
+
+    if config.pipeline.is_empty() {
+        warnings.push("Keine Pipelines konfiguriert".to_string());
+    } else {
+        info_msgs.push(format!("{} Pipeline(s) konfiguriert", config.pipeline.len()));
+
+        for p in &config.pipeline {
+            if p.gpu_priority < 1 || p.gpu_priority > 5 {
+                warnings.push(format!(
+                    "Pipeline '{}': gpu_priority {} außerhalb 1-5",
+                    p.container, p.gpu_priority
+                ));
+            }
+            if p.vram_estimate_mb == 0 {
+                warnings.push(format!(
+                    "Pipeline '{}': vram_estimate_mb ist 0 (ungewöhnlich)",
+                    p.container
+                ));
+            }
+        }
+    }
+
+    // 4. GPU-Config prüfen
+    if config.gpu.poll_interval_seconds == 0 {
+        warnings.push("gpu.poll_interval_secs ist 0 (Polling deaktiviert)".to_string());
+    }
+
+    // 5. LLM Gateway prüfen
+    if let Some(ref gw) = config.llm_gateway {
+        info_msgs.push(format!(
+            "LLM Gateway: {} Provider, {} App-Routings",
+            gw.providers.len(),
+            gw.app_routing.len()
+        ));
+
+        for app in &gw.app_routing {
+            if !app.preferred_provider.is_empty() {
+                let provider_exists = gw.providers.iter().any(|p| p.name == app.preferred_provider);
+                if !provider_exists {
+                    warnings.push(format!(
+                        "App '{}': preferred_provider '{}' existiert nicht in providers",
+                        app.app_id, app.preferred_provider
+                    ));
+                }
+            }
+        }
+    }
+
+    // 6. Ollama-Instanzen
+    let instance_count = config.ollama_instance.len();
+    if instance_count > 0 {
+        info_msgs.push(format!("{instance_count} Ollama-Instanz(en) konfiguriert"));
+    }
+
+    // 7. Remote-GPU prüfen
+    let remote_count = config.remote_gpu.len();
+    if remote_count > 0 {
+        info_msgs.push(format!("{remote_count} Remote-GPU(s) konfiguriert"));
+    }
+
+    // Ausgabe
+    for msg in &info_msgs {
+        println!("  {msg}");
+    }
+
+    if warnings.is_empty() {
+        println!("\n  Validierung erfolgreich — keine Probleme gefunden.");
+    } else {
+        println!("\n  {} Warnung(en):", warnings.len());
+        for w in &warnings {
+            println!("    ! {w}");
+        }
     }
 
     Ok(())

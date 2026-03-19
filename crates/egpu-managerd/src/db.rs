@@ -76,17 +76,18 @@ pub struct FallbackOverride {
 
 /// Thread-safe database handle wrapping rusqlite (which is not Send).
 /// All operations go through a Mutex-guarded connection.
-/// LLM-Nutzungsdatensatz fuer Budget-Persistierung
+
+/// Persistierter Lease fuer Daemon-Restart-Recovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LlmUsageRecord {
-    pub id: Option<i64>,
-    pub app_id: String,
-    pub provider: String,
-    pub model: String,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cost_usd: f64,
-    pub timestamp: DateTime<Utc>,
+pub struct PersistedLease {
+    pub lease_id: String,
+    pub pipeline: String,
+    pub gpu_device: String,
+    pub workload_type: String,
+    pub vram_mb: u64,
+    pub acquired_at: String,
+    pub expires_at: String,
+    pub last_heartbeat: String,
 }
 
 #[derive(Clone)]
@@ -205,6 +206,17 @@ impl EventDb {
             );
             CREATE INDEX IF NOT EXISTS idx_llm_usage_app ON llm_usage(app_id);
             CREATE INDEX IF NOT EXISTS idx_llm_usage_timestamp ON llm_usage(timestamp);
+
+            CREATE TABLE IF NOT EXISTS active_leases (
+                lease_id        TEXT PRIMARY KEY,
+                pipeline        TEXT NOT NULL,
+                gpu_device      TEXT NOT NULL,
+                workload_type   TEXT NOT NULL,
+                vram_mb         INTEGER NOT NULL,
+                acquired_at     TEXT NOT NULL,
+                expires_at      TEXT NOT NULL,
+                last_heartbeat  TEXT NOT NULL
+            );
             ",
         )?;
         Ok(())
@@ -444,85 +456,102 @@ impl EventDb {
         Ok(overrides)
     }
 
-    /// Remove a fallback override by service name.
-    pub async fn remove_fallback_override(&self, service_name: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "DELETE FROM fallback_overrides WHERE service_name = ?1",
-            params![service_name],
-        )?;
-        Ok(())
-    }
+    // ─── Lease-Persistenz ─────────────────────────────────────────────────
+    // Leases werden in SQLite gespeichert um Daemon-Neustarts zu überleben.
+    // Bei Restart werden nicht-abgelaufene Leases wiederhergestellt.
 
-    /// LLM-Nutzung in die Datenbank schreiben (Budget-Persistierung).
-    pub async fn save_llm_usage(
+    /// Speichert einen aktiven Lease in der Datenbank.
+    pub async fn save_lease(
         &self,
-        app_id: &str,
-        provider: &str,
-        model: &str,
-        input_tokens: i64,
-        output_tokens: i64,
-        cost_usd: f64,
+        lease_id: &str,
+        pipeline: &str,
+        gpu_device: &str,
+        workload_type: &str,
+        vram_mb: u64,
+        acquired_at: &DateTime<Utc>,
+        expires_at: &DateTime<Utc>,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO llm_usage (app_id, provider, model, input_tokens, output_tokens, cost_usd, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO active_leases
+             (lease_id, pipeline, gpu_device, workload_type, vram_mb, acquired_at, expires_at, last_heartbeat)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                app_id,
-                provider,
-                model,
-                input_tokens,
-                output_tokens,
-                cost_usd,
+                lease_id,
+                pipeline,
+                gpu_device,
+                workload_type,
+                vram_mb as i64,
+                acquired_at.to_rfc3339(),
+                expires_at.to_rfc3339(),
                 Utc::now().to_rfc3339(),
             ],
         )?;
         Ok(())
     }
 
-    /// LLM-Nutzung des aktuellen Monats fuer eine App abfragen.
-    pub async fn query_monthly_usage(&self, app_id: &str) -> anyhow::Result<Vec<LlmUsageRecord>> {
+    /// Entfernt einen Lease aus der Datenbank (nach Release).
+    pub async fn remove_lease(&self, lease_id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().await;
-        let month_start = {
-            let now = Utc::now();
-            now.format("%Y-%m-01T00:00:00+00:00").to_string()
-        };
+        conn.execute(
+            "DELETE FROM active_leases WHERE lease_id = ?1",
+            params![lease_id],
+        )?;
+        Ok(())
+    }
+
+    /// Aktualisiert den Heartbeat-Timestamp eines Leases.
+    pub async fn update_lease_heartbeat(&self, lease_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE active_leases SET last_heartbeat = ?1 WHERE lease_id = ?2",
+            params![Utc::now().to_rfc3339(), lease_id],
+        )?;
+        Ok(())
+    }
+
+    /// Lädt alle nicht-abgelaufenen Leases (für Daemon-Restart-Recovery).
+    pub async fn load_active_leases(&self) -> anyhow::Result<Vec<PersistedLease>> {
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
 
         let mut stmt = conn.prepare(
-            "SELECT id, app_id, provider, model, input_tokens, output_tokens, cost_usd, timestamp
-             FROM llm_usage WHERE app_id = ?1 AND timestamp >= ?2 ORDER BY timestamp DESC",
+            "SELECT lease_id, pipeline, gpu_device, workload_type, vram_mb, acquired_at, expires_at, last_heartbeat
+             FROM active_leases WHERE expires_at > ?1",
         )?;
 
-        let rows = stmt.query_map(params![app_id, month_start], |row| {
-            let id: i64 = row.get(0)?;
-            let app_id: String = row.get(1)?;
-            let provider: String = row.get(2)?;
-            let model: String = row.get(3)?;
-            let input_tokens: i64 = row.get(4)?;
-            let output_tokens: i64 = row.get(5)?;
-            let cost_usd: f64 = row.get(6)?;
-            let ts_str: String = row.get(7)?;
-
-            Ok(LlmUsageRecord {
-                id: Some(id),
-                app_id,
-                provider,
-                model,
-                input_tokens,
-                output_tokens,
-                cost_usd,
-                timestamp: DateTime::parse_from_rfc3339(&ts_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
+        let rows = stmt.query_map(params![now], |row| {
+            Ok(PersistedLease {
+                lease_id: row.get(0)?,
+                pipeline: row.get(1)?,
+                gpu_device: row.get(2)?,
+                workload_type: row.get(3)?,
+                vram_mb: row.get::<_, i64>(4)? as u64,
+                acquired_at: row.get(5)?,
+                expires_at: row.get(6)?,
+                last_heartbeat: row.get(7)?,
             })
         })?;
 
-        let mut records = Vec::new();
+        let mut leases = Vec::new();
         for row in rows {
-            records.push(row?);
+            leases.push(row?);
         }
-        Ok(records)
+        Ok(leases)
+    }
+
+    /// Entfernt alle abgelaufenen Leases.
+    pub async fn clean_expired_leases(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        let deleted = conn.execute(
+            "DELETE FROM active_leases WHERE expires_at <= ?1",
+            params![now],
+        )?;
+        if deleted > 0 {
+            info!("Lease-Cleanup: {} abgelaufene Leases entfernt", deleted);
+        }
+        Ok(deleted)
     }
 
     /// Datenbankgroesse in MB pruefen (fuer max_db_size_mb Monitoring).
@@ -623,13 +652,6 @@ impl EventDb {
             params![cutoff],
         )?;
         Ok(deleted)
-    }
-
-    /// VACUUM ausfuehren um Speicherplatz nach Loeschungen freizugeben.
-    pub async fn vacuum(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().await;
-        conn.execute_batch("VACUUM;")?;
-        Ok(())
     }
 
     /// Helper: insert event shorthand
@@ -769,6 +791,127 @@ mod tests {
             status: "completed".to_string(),
         };
         db.upsert_recovery_state(&state2).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_lease_persistence_save_and_load() {
+        let db = EventDb::open_in_memory().unwrap();
+        let now = Utc::now();
+        let expires = now + chrono::Duration::hours(2);
+
+        db.save_lease(
+            "lease-abc123",
+            "audit_designer",
+            "0000:05:00.0",
+            "embeddings",
+            4000,
+            &now,
+            &expires,
+        )
+        .await
+        .unwrap();
+
+        let leases = db.load_active_leases().await.unwrap();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].lease_id, "lease-abc123");
+        assert_eq!(leases[0].pipeline, "audit_designer");
+        assert_eq!(leases[0].vram_mb, 4000);
+    }
+
+    #[tokio::test]
+    async fn test_lease_persistence_remove() {
+        let db = EventDb::open_in_memory().unwrap();
+        let now = Utc::now();
+        let expires = now + chrono::Duration::hours(2);
+
+        db.save_lease("lease-1", "app1", "0000:05:00.0", "llm", 2000, &now, &expires)
+            .await
+            .unwrap();
+
+        db.remove_lease("lease-1").await.unwrap();
+
+        let leases = db.load_active_leases().await.unwrap();
+        assert_eq!(leases.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_lease_persistence_expired_not_loaded() {
+        let db = EventDb::open_in_memory().unwrap();
+        let now = Utc::now();
+        let expired = now - chrono::Duration::hours(1); // Bereits abgelaufen
+
+        db.save_lease(
+            "lease-expired",
+            "app1",
+            "0000:05:00.0",
+            "llm",
+            2000,
+            &(now - chrono::Duration::hours(3)),
+            &expired,
+        )
+        .await
+        .unwrap();
+
+        let leases = db.load_active_leases().await.unwrap();
+        assert_eq!(leases.len(), 0); // Abgelaufen → nicht geladen
+    }
+
+    #[tokio::test]
+    async fn test_lease_persistence_clean_expired() {
+        let db = EventDb::open_in_memory().unwrap();
+        let now = Utc::now();
+
+        // Abgelaufener Lease
+        db.save_lease(
+            "lease-old",
+            "app1",
+            "0000:05:00.0",
+            "llm",
+            2000,
+            &(now - chrono::Duration::hours(5)),
+            &(now - chrono::Duration::hours(1)),
+        )
+        .await
+        .unwrap();
+
+        // Aktiver Lease
+        db.save_lease(
+            "lease-new",
+            "app2",
+            "0000:02:00.0",
+            "embeddings",
+            4000,
+            &now,
+            &(now + chrono::Duration::hours(2)),
+        )
+        .await
+        .unwrap();
+
+        let cleaned = db.clean_expired_leases().await.unwrap();
+        assert_eq!(cleaned, 1);
+
+        // Nur der aktive Lease bleibt
+        let leases = db.load_active_leases().await.unwrap();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].lease_id, "lease-new");
+    }
+
+    #[tokio::test]
+    async fn test_lease_heartbeat_update() {
+        let db = EventDb::open_in_memory().unwrap();
+        let now = Utc::now();
+        let expires = now + chrono::Duration::hours(2);
+
+        db.save_lease("lease-hb", "app1", "0000:05:00.0", "llm", 2000, &now, &expires)
+            .await
+            .unwrap();
+
+        db.update_lease_heartbeat("lease-hb").await.unwrap();
+
+        let leases = db.load_active_leases().await.unwrap();
+        assert_eq!(leases.len(), 1);
+        // Heartbeat sollte aktualisiert sein
+        assert_ne!(leases[0].last_heartbeat, leases[0].acquired_at);
     }
 
     #[tokio::test]

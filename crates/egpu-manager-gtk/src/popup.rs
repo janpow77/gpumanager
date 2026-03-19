@@ -9,7 +9,7 @@ use gtk::{
 
 use crate::state::{ConnectionState, GpuInfo, HealthScoreInfo, PipelineInfo, RemoteGpuInfo, WidgetState};
 
-/// Shared state to remember the active tab across redraws.
+// Shared state to remember the active tab across redraws.
 thread_local! {
     static ACTIVE_TAB: Rc<Cell<u32>> = Rc::new(Cell::new(0));
 }

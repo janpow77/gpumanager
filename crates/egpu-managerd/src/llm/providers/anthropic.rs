@@ -188,29 +188,6 @@ impl LlmProvider for AnthropicProvider {
         Ok(self.convert_response(anthropic_resp))
     }
 
-    async fn chat_completion_stream(
-        &self,
-        request: &ChatCompletionRequest,
-    ) -> Result<Vec<ChatCompletionChunk>, ProviderError> {
-        // Vereinfacht: nicht-streamend aufrufen und als einzelnen Chunk zurueckgeben
-        let response = self.chat_completion(request).await?;
-        let chunk = ChatCompletionChunk {
-            id: response.id,
-            object: "chat.completion.chunk".into(),
-            created: response.created,
-            model: response.model,
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: ChunkDelta {
-                    role: Some("assistant".into()),
-                    content: response.choices.first().map(|c| c.message.content.clone()),
-                },
-                finish_reason: Some("stop".into()),
-            }],
-        };
-        Ok(vec![chunk])
-    }
-
     async fn health_check(&self) -> bool {
         // Anthropic hat keinen einfachen Health-Endpoint;
         // pruefe ob ein API-Key konfiguriert ist
@@ -244,6 +221,7 @@ mod tests {
             stop: None,
             app_id: None,
             provider: None,
+            workload_type: None,
         };
 
         let converted = provider.convert_request(&request);

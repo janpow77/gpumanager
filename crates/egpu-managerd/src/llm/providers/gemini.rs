@@ -199,29 +199,6 @@ impl LlmProvider for GeminiProvider {
         Ok(self.convert_response(gemini_resp, &request.model))
     }
 
-    async fn chat_completion_stream(
-        &self,
-        request: &ChatCompletionRequest,
-    ) -> Result<Vec<ChatCompletionChunk>, ProviderError> {
-        // Vereinfacht: nicht-streamend aufrufen und als einzelnen Chunk zurueckgeben
-        let response = self.chat_completion(request).await?;
-        let chunk = ChatCompletionChunk {
-            id: response.id,
-            object: "chat.completion.chunk".into(),
-            created: response.created,
-            model: response.model,
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: ChunkDelta {
-                    role: Some("assistant".into()),
-                    content: response.choices.first().map(|c| c.message.content.clone()),
-                },
-                finish_reason: Some("stop".into()),
-            }],
-        };
-        Ok(vec![chunk])
-    }
-
     async fn health_check(&self) -> bool {
         // Pruefe ob ein API-Key konfiguriert ist
         self.api_key.is_some()

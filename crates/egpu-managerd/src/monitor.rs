@@ -87,9 +87,25 @@ pub struct MonitorState {
     pub gpu_status: Vec<GpuStatus>,
     pub pcie_throughput: HashMap<String, PcieThroughput>,
     pub ollama_models: Vec<OllamaModel>,
+    /// Modelle pro Ollama-Instanz (Fleet-Modus)
+    pub ollama_models_by_instance: HashMap<String, Vec<OllamaModel>>,
     pub active_leases: HashMap<String, GpuLease>,
     pub recovery_active: bool,
     pub remote_gpus: Vec<RegisteredRemoteGpu>,
+}
+
+impl MonitorState {
+    /// Alle Ollama-Modelle (aus allen Instanzen) als flache Liste.
+    pub fn all_ollama_models(&self) -> Vec<OllamaModel> {
+        if !self.ollama_models_by_instance.is_empty() {
+            self.ollama_models_by_instance
+                .values()
+                .flat_map(|v| v.iter().cloned())
+                .collect()
+        } else {
+            self.ollama_models.clone()
+        }
+    }
 }
 
 /// The monitoring orchestrator. Spawns all monitoring tasks and
@@ -176,6 +192,7 @@ impl MonitorOrchestrator {
             gpu_status: Vec::new(),
             pcie_throughput: HashMap::new(),
             ollama_models: Vec::new(),
+            ollama_models_by_instance: HashMap::new(),
             active_leases: HashMap::new(),
             recovery_active: false,
             remote_gpus: Vec::new(),
@@ -351,35 +368,64 @@ impl MonitorOrchestrator {
     async fn handle_trigger(&self, trigger: WarningTrigger) {
         let trigger_str = trigger.to_string();
         let trigger_clone = trigger.clone();
-        let mut state = self.state.lock().await;
 
-        // FIX 12: Health-Score-Events bei JEDEM Trigger aufzeichnen, nicht nur bei Eskalation
-        match &trigger_clone {
-            t if *t == WarningTrigger::AerThreshold || *t == WarningTrigger::AerBurst => {
-                state.health_score.record_event(HealthEventKind::AerError);
-            }
-            t if *t == WarningTrigger::LinkWidthDegradation
-                || *t == WarningTrigger::LinkSpeedDegradation
-                || *t == WarningTrigger::LinkDown =>
-            {
-                state
-                    .health_score
-                    .record_event(HealthEventKind::PcieTransient);
-            }
-            // FIX 11: CmpltToPattern und GpuProgressError ebenfalls als PCIe-Transient werten
-            t if *t == WarningTrigger::CmpltToPattern || *t == WarningTrigger::GpuProgressError => {
-                state
-                    .health_score
-                    .record_event(HealthEventKind::PcieTransient);
-            }
-            WarningTrigger::XidError { .. } => {
-                state.health_score.record_event(HealthEventKind::XidError);
-            }
-            _ => {}
-        }
+        // M1: Collect data under lock, then drop before async I/O
+        let level_change = {
+            let mut state = self.state.lock().await;
 
-        if let Some(new_level) = state.warning_machine.process_trigger(trigger) {
-            // Log the level change
+            // FIX 12: Health-Score-Events bei JEDEM Trigger aufzeichnen, nicht nur bei Eskalation
+            match &trigger_clone {
+                t if *t == WarningTrigger::AerThreshold || *t == WarningTrigger::AerBurst => {
+                    state.health_score.record_event(HealthEventKind::AerError);
+                }
+                t if *t == WarningTrigger::LinkWidthDegradation
+                    || *t == WarningTrigger::LinkSpeedDegradation
+                    || *t == WarningTrigger::LinkDown =>
+                {
+                    state
+                        .health_score
+                        .record_event(HealthEventKind::PcieTransient);
+                }
+                // FIX 11: CmpltToPattern und GpuProgressError ebenfalls als PCIe-Transient werten
+                t if *t == WarningTrigger::CmpltToPattern || *t == WarningTrigger::GpuProgressError => {
+                    state
+                        .health_score
+                        .record_event(HealthEventKind::PcieTransient);
+                }
+                WarningTrigger::XidError { .. } => {
+                    state.health_score.record_event(HealthEventKind::XidError);
+                }
+                _ => {}
+            }
+
+            if let Some(new_level) = state.warning_machine.process_trigger(trigger) {
+                // Update scheduler warning level
+                state.scheduler.set_warning_level(new_level);
+
+                // Get migration actions
+                let pipelines_on_egpu: Vec<(String, u32)> = state
+                    .scheduler
+                    .pipelines_on_gpu(GpuTarget::Egpu)
+                    .iter()
+                    .map(|a| (a.name.clone(), a.priority))
+                    .collect();
+
+                let actions = state.warning_machine.migration_actions(&pipelines_on_egpu);
+
+                // Check if recovery should be spawned
+                let should_start_recovery = new_level >= WarningLevel::Orange && !state.recovery_active;
+                if should_start_recovery {
+                    state.recovery_active = true;
+                }
+
+                Some((new_level, actions, should_start_recovery))
+            } else {
+                None
+            }
+        };
+        // Lock dropped here — db.log_event(), SSE, recovery happen outside lock
+
+        if let Some((new_level, actions, should_start_recovery)) = level_change {
             let severity = match new_level {
                 WarningLevel::Green => Severity::Info,
                 WarningLevel::Yellow => Severity::Warning,
@@ -425,18 +471,6 @@ impl MonitorOrchestrator {
                 );
             }
 
-            // Update scheduler warning level
-            state.scheduler.set_warning_level(new_level);
-
-            // Get migration actions
-            let pipelines_on_egpu: Vec<(String, u32)> = state
-                .scheduler
-                .pipelines_on_gpu(GpuTarget::Egpu)
-                .iter()
-                .map(|a| (a.name.clone(), a.priority))
-                .collect();
-
-            let actions = state.warning_machine.migration_actions(&pipelines_on_egpu);
             for action in &actions {
                 info!(
                     "Migration-Aktion: {} — {:?} (Prio {})",
@@ -445,8 +479,7 @@ impl MonitorOrchestrator {
             }
 
             // Gap 3: Try pressure reduction before full recovery at Orange
-            if new_level >= WarningLevel::Orange && !state.recovery_active {
-                state.recovery_active = true;
+            if should_start_recovery {
                 let config_clone = Arc::clone(&self.config);
                 let db_clone = self.db.clone();
                 let sse_clone = self.sse.clone();
@@ -522,7 +555,7 @@ impl MonitorOrchestrator {
         // um Einzel-Sprünge beim Laststart zu glätten
         let mut temp_history: VecDeque<(u32, std::time::Instant)> = VecDeque::with_capacity(12);
 
-        // Build Ollama control for auto-unloading
+        // Build Ollama control for auto-unloading (Legacy single-instance)
         let ollama_ctl = config.ollama.as_ref().and_then(|cfg| {
             if cfg.enabled {
                 Some(crate::ollama::HttpOllamaControl::new(&cfg.host))
@@ -530,6 +563,21 @@ impl MonitorOrchestrator {
                 None
             }
         });
+
+        // OllamaFleet für Multi-Instanz-Modus
+        let mut ollama_fleet = {
+            let instances = config.resolve_ollama_instances();
+            if instances.is_empty() {
+                None
+            } else {
+                Some(crate::ollama::OllamaFleet::new(
+                    instances,
+                    &config.gpu.egpu_pci_address,
+                ))
+            }
+        };
+        // Per-Instance Idle-Tracking
+        let mut fleet_idle_trackers: HashMap<String, Option<std::time::Instant>> = HashMap::new();
 
         info!(
             "GPU-Poller gestartet (Intervall: {}s)",
@@ -579,10 +627,13 @@ impl MonitorOrchestrator {
                             }
                             smi_response_times.push_back(response_ms);
 
+                            // M2: Collect health events locally, apply in single lock
+                            let mut pending_health_events: Vec<HealthEventKind> = Vec::new();
+                            let mut pending_triggers: Vec<WarningTrigger> = Vec::new();
+
                             // Check for slow single response -> health score penalty
                             if response_ms > 1000 {
-                                let mut st = state.lock().await;
-                                st.health_score.record_event(HealthEventKind::NvidiaSmiSlow);
+                                pending_health_events.push(HealthEventKind::NvidiaSmiSlow);
                             }
 
                             // Check average response time
@@ -594,7 +645,7 @@ impl MonitorOrchestrator {
                                         "nvidia-smi Durchschnitts-Antwortzeit {}ms > {}ms",
                                         avg, config.gpu.nvidia_smi_slow_threshold_ms
                                     );
-                                    let _ = trigger_tx.send(WarningTrigger::NvidiaSmiSlow).await;
+                                    pending_triggers.push(WarningTrigger::NvidiaSmiSlow);
                                 }
                             }
 
@@ -607,7 +658,10 @@ impl MonitorOrchestrator {
                                 }
                             }
 
-                            // eGPU-specific proactive checks
+                            // M5: Track eGPU availability for scheduler
+                            let egpu_visible = gpus.iter().any(|g| g.pci_address == config.gpu.egpu_pci_address);
+
+                            // eGPU-specific proactive checks (no lock needed — local analysis)
                             if let Some(egpu_status) = gpus.iter().find(|g| g.pci_address == config.gpu.egpu_pci_address) {
                                 // --- P-State throttling detection ---
                                 let pstate_num = egpu_status.pstate
@@ -615,13 +669,10 @@ impl MonitorOrchestrator {
                                     .parse::<u32>()
                                     .unwrap_or(0);
 
-                                // P-State Throttling: Nur relevant wenn GPU aktiv arbeitet
-                                // UND sich in einem Throttle-State befindet (P4-P6).
-                                // P8+ ist normaler Idle-Zustand — kein Throttle-Indikator.
                                 let gpu_is_active = egpu_status.utilization_gpu_percent > 5
                                     || (egpu_status.memory_used_mb > 500 && egpu_status.utilization_gpu_percent > 0);
                                 let is_throttle_state = pstate_num >= config.gpu.pstate_throttle_threshold
-                                    && pstate_num < 8; // P8+ = Idle, kein Throttle
+                                    && pstate_num < 8;
 
                                 if is_throttle_state && gpu_is_active {
                                     match pstate_p4_since {
@@ -633,10 +684,8 @@ impl MonitorOrchestrator {
                                                     pstate_num, sustained,
                                                     egpu_status.utilization_gpu_percent
                                                 );
-                                                let _ = trigger_tx.send(WarningTrigger::PstateThrottle).await;
-                                                let mut st = state.lock().await;
-                                                st.health_score.record_event(HealthEventKind::PstateAnomaly);
-                                                // Timer reset um nicht jede Sekunde zu feuern
+                                                pending_triggers.push(WarningTrigger::PstateThrottle);
+                                                pending_health_events.push(HealthEventKind::PstateAnomaly);
                                                 pstate_p4_since = Some(std::time::Instant::now());
                                             }
                                         }
@@ -649,21 +698,16 @@ impl MonitorOrchestrator {
                                 }
 
                                 // --- Thermal gradient detection ---
-                                // Gradient über gleitendes 60s-Fenster berechnen,
-                                // nicht zwischen zwei 5s-Samples (das erzeugt Artefakte
-                                // von 200+ °C/min bei normalem Laststart).
                                 let current_temp = egpu_status.temperature_c;
                                 let now_instant = std::time::Instant::now();
                                 temp_history.push_back((current_temp, now_instant));
 
-                                // Alte Samples (> 60s) entfernen
                                 while temp_history.len() > 1
                                     && temp_history.front().unwrap().1.elapsed().as_secs() > 60
                                 {
                                     temp_history.pop_front();
                                 }
 
-                                // Gradient nur berechnen wenn >= 30s an History (6 Samples)
                                 if temp_history.len() >= 6 {
                                     let (oldest_temp, oldest_time) = temp_history.front().unwrap();
                                     let elapsed_min = oldest_time.elapsed().as_secs_f64() / 60.0;
@@ -674,7 +718,6 @@ impl MonitorOrchestrator {
                                             0.0
                                         };
 
-                                        // Nur warnen wenn Temp bereits gefährlich nah am Throttle-Limit
                                         let temp_threshold = 76u32;
                                         if gradient > config.gpu.thermal_gradient_warning_c_per_min
                                             && current_temp >= temp_threshold
@@ -686,49 +729,42 @@ impl MonitorOrchestrator {
                                                 current_temp,
                                                 oldest_time.elapsed().as_secs(),
                                             );
-                                            let mut st = state.lock().await;
-                                            st.health_score.record_event(HealthEventKind::TemperatureSpike);
+                                            pending_health_events.push(HealthEventKind::TemperatureSpike);
                                         }
                                     }
                                 }
 
                                 // --- Absolute thermal thresholds ---
                                 if current_temp >= config.gpu.thermal_critical_temp_c {
-                                    let _ = trigger_tx.send(WarningTrigger::ThermalCritical).await;
-                                    let mut st = state.lock().await;
-                                    st.health_score.record_event(HealthEventKind::TemperatureSpike);
+                                    pending_triggers.push(WarningTrigger::ThermalCritical);
+                                    pending_health_events.push(HealthEventKind::TemperatureSpike);
                                 } else if current_temp >= config.gpu.thermal_throttle_temp_c {
-                                    let _ = trigger_tx.send(WarningTrigger::ThermalThrottle).await;
+                                    pending_triggers.push(WarningTrigger::ThermalThrottle);
                                 }
 
                                 // FIX 24: Power-Draw-Anomalie-Erkennung
                                 let power_w = egpu_status.power_draw_w;
-                                let tdp_w = 300.0_f64; // RTX 5070 Ti TDP (erhoeht fuer Boost-Headroom)
+                                let tdp_w = 300.0_f64;
 
-                                // Baseline aktualisieren (gleitender Durchschnitt)
                                 power_baseline = Some(match power_baseline {
                                     Some(baseline) => baseline * 0.95 + power_w * 0.05,
                                     None => power_w,
                                 });
 
-                                // Ploetzlicher Abfall auf < 5W bei aktiver GPU (PCIe-Link-Problem)
                                 if power_w < 5.0 && egpu_status.utilization_gpu_percent > 10 {
                                     warn!(
                                         "Power-Draw-Anomalie: {:.1}W bei {}% Auslastung — moeglicherweise PCIe-Link-Problem",
                                         power_w, egpu_status.utilization_gpu_percent
                                     );
-                                    let mut st = state.lock().await;
-                                    st.health_score.record_event(HealthEventKind::PcieTransient);
+                                    pending_health_events.push(HealthEventKind::PcieTransient);
                                 }
 
-                                // Dauerhafte Ueberschreitung von TDP * 1.1 (Thermisches Risiko)
                                 if power_w > tdp_w * 1.1 {
                                     warn!(
                                         "Power-Draw {:.1}W ueberschreitet TDP*1.1 ({:.1}W) — thermisches Risiko",
                                         power_w, tdp_w * 1.1
                                     );
-                                    let mut st = state.lock().await;
-                                    st.health_score.record_event(HealthEventKind::TemperatureSpike);
+                                    pending_health_events.push(HealthEventKind::TemperatureSpike);
                                 }
 
                                 // Track GPU activity for idle detection
@@ -737,11 +773,98 @@ impl MonitorOrchestrator {
                                 }
                             }
 
+                            // SM Clock Variance + Power Instability detection (no lock)
+                            if let Some(egpu) = gpus.iter().find(|g| g.pci_address == config.gpu.egpu_pci_address) {
+                                let clock = egpu.clock_graphics_mhz as f64;
+                                clock_baseline = Some(match clock_baseline {
+                                    Some(baseline) => baseline * 0.95 + clock * 0.05,
+                                    None => clock,
+                                });
+                                if let Some(baseline) = clock_baseline {
+                                    if clock < baseline * 0.8 && egpu.utilization_gpu_percent > 50 {
+                                        warn!(
+                                            "SM-Clock-Varianz: {} MHz < 80% von Baseline {:.0} MHz bei {}% Auslastung",
+                                            egpu.clock_graphics_mhz, baseline, egpu.utilization_gpu_percent
+                                        );
+                                        pending_health_events.push(HealthEventKind::SmClockVariance);
+                                    }
+                                }
+
+                                let power = egpu.power_draw_w;
+                                if power_history.len() >= 10 {
+                                    power_history.pop_front();
+                                }
+                                power_history.push_back(power);
+                                if power_history.len() >= 3 {
+                                    let mean = power_history.iter().sum::<f64>() / power_history.len() as f64;
+                                    let variance = power_history.iter()
+                                        .map(|p| (p - mean).powi(2))
+                                        .sum::<f64>() / power_history.len() as f64;
+                                    let stddev = variance.sqrt();
+                                    if mean > 50.0 && stddev > mean * 0.3 {
+                                        warn!(
+                                            "Power-Instabilitaet: Stddev {:.1}W bei Mean {:.1}W (>30%)",
+                                            stddev, mean
+                                        );
+                                        pending_health_events.push(HealthEventKind::PowerInstability);
+                                    }
+                                }
+                            }
+
+                            // Power budget check (no lock)
+                            if config.gpu.max_combined_power_w > 0.0 {
+                                let combined_power: f64 = gpus.iter().map(|g| g.power_draw_w).sum();
+                                if combined_power > config.gpu.max_combined_power_w * 0.9 {
+                                    warn!(
+                                        "Kombinierte GPU-Last {:.0}W > 90% von {:.0}W Budget",
+                                        combined_power, config.gpu.max_combined_power_w
+                                    );
+                                }
+                            }
+
+                            // Query compute processes outside lock (sync NVML call)
+                            let mut internal_display_reserves: Vec<(GpuTarget, u64)> = Vec::new();
+                            for gpu in &gpus {
+                                let target = if gpu.pci_address == config.gpu.egpu_pci_address {
+                                    GpuTarget::Egpu
+                                } else {
+                                    GpuTarget::Internal
+                                };
+                                if target == GpuTarget::Internal {
+                                    if let Ok(procs) = gpu_monitor.query_compute_processes(&gpu.pci_address) {
+                                        let total_compute: u64 = procs.iter().map(|p| p.used_mb).sum();
+                                        const DISPLAY_SAFETY_HEADROOM_MB: u64 = 512;
+                                        let display_vram = gpu.memory_used_mb.saturating_sub(total_compute);
+                                        let effective_reserve = (display_vram + DISPLAY_SAFETY_HEADROOM_MB).max(config.gpu.display_vram_reserve_mb);
+                                        internal_display_reserves.push((target, effective_reserve));
+                                    }
+                                }
+                            }
+
                             // Idle tracking and thermal protection for eGPU (Ollama)
-                            if let Some(ref ollama_cfg) = config.ollama {
+                            // Fleet-Modus: Thermal-Unload pro Instanz
+                            if let Some(ref fleet) = ollama_fleet {
                                 let egpu = gpus.iter().find(|g| g.pci_address == config.gpu.egpu_pci_address);
                                 if let Some(egpu_status) = egpu {
-                                    // Thermal protection: unload models if GPU is too hot
+                                    for inst in fleet.all_instances() {
+                                        if inst.gpu_target == crate::scheduler::GpuTarget::Egpu
+                                            && inst.config.thermal_unload_temp_c > 0
+                                            && egpu_status.temperature_c >= inst.config.thermal_unload_temp_c
+                                            && inst.available
+                                        {
+                                            warn!(
+                                                "GPU-Temperatur {}°C >= {}°C — entlade Modelle auf '{}'",
+                                                egpu_status.temperature_c,
+                                                inst.config.thermal_unload_temp_c,
+                                                inst.config.name,
+                                            );
+                                            Self::unload_all_ollama_models(&inst.control, &state).await;
+                                        }
+                                    }
+                                }
+                            } else if let Some(ref ollama_cfg) = config.ollama {
+                                let egpu = gpus.iter().find(|g| g.pci_address == config.gpu.egpu_pci_address);
+                                if let Some(egpu_status) = egpu {
                                     if ollama_cfg.thermal_unload_temp_c > 0
                                         && egpu_status.temperature_c >= ollama_cfg.thermal_unload_temp_c
                                     {
@@ -757,9 +880,20 @@ impl MonitorOrchestrator {
                                 }
                             }
 
-                            // Update scheduler compute utilization + VRAM capacities
-                            {
+                            // M2: Single bulk lock acquisition for all state updates
+                            let (health_score_summary, health_trigger, telemetry_data) = {
+                                let lock_start = std::time::Instant::now();
                                 let mut st = state.lock().await;
+
+                                // Apply all pending health events
+                                for event in &pending_health_events {
+                                    st.health_score.record_event(event.clone());
+                                }
+
+                                // M5: Update eGPU availability in scheduler
+                                st.scheduler.set_egpu_available(egpu_visible);
+
+                                // Update scheduler compute utilization + VRAM capacities
                                 for gpu in &gpus {
                                     let target = if gpu.pci_address == config.gpu.egpu_pci_address {
                                         GpuTarget::Egpu
@@ -767,23 +901,21 @@ impl MonitorOrchestrator {
                                         GpuTarget::Internal
                                     };
                                     st.scheduler.set_compute_utilization(target, gpu.utilization_gpu_percent);
-
-                                    // Aktualisiere Gesamt-VRAM aus nvidia-smi (statt Hardcoded-Wert)
                                     st.scheduler.update_total_vram(target, gpu.memory_total_mb);
 
-                                    // Interne GPU: Display-Reserve dynamisch aus tatsaechlicher
-                                    // VRAM-Nutzung ableiten. GNOME/GDM/Compositor belegen VRAM
-                                    // das der Scheduler NICHT fuer Workloads verplanen darf.
-                                    // Minimum: config-Wert ODER tatsaechliche Nutzung + Safety-Headroom
                                     if target == GpuTarget::Internal {
-                                        // Safety-Headroom: 512 MB fuer GDM-Session-Wechsel, neue Fenster etc.
                                         const DISPLAY_SAFETY_HEADROOM_MB: u64 = 512;
                                         let dynamic_reserve = gpu.memory_used_mb + DISPLAY_SAFETY_HEADROOM_MB;
-                                        // Verwende Maximum aus Config-Wert und dynamischem Wert
                                         let effective_reserve = dynamic_reserve.max(config.gpu.display_vram_reserve_mb);
                                         st.scheduler.update_display_reserve(target, effective_reserve);
                                     }
                                 }
+
+                                // Apply compute-process-based display reserves
+                                for (target, reserve) in &internal_display_reserves {
+                                    st.scheduler.update_display_reserve(*target, *reserve);
+                                }
+
                                 st.gpu_status = gpus.clone();
 
                                 // Prometheus metrics update
@@ -794,7 +926,6 @@ impl MonitorOrchestrator {
                                             gpu.memory_used_mb, gpu.memory_total_mb, gpu.power_draw_w,
                                             gpu.clock_graphics_mhz, gpu.clock_memory_mhz);
                                     }
-                                    // Scheduler metrics
                                     m.scheduler_queue_length.set(st.scheduler.queue().len() as i64);
                                     m.active_leases_total.set(st.active_leases.len() as i64);
                                     m.recovery_active.set(if st.recovery_active { 1 } else { 0 });
@@ -806,89 +937,78 @@ impl MonitorOrchestrator {
                                         WarningLevel::Red => 3,
                                     };
                                     m.set_warning_level(wl);
-                                }
 
-                                // Update actual VRAM for internal GPU from compute processes
-                                for gpu in &gpus {
-                                    let target = if gpu.pci_address == config.gpu.egpu_pci_address {
-                                        GpuTarget::Egpu
-                                    } else {
-                                        GpuTarget::Internal
-                                    };
-                                    if target == GpuTarget::Internal {
-                                        if let Ok(procs) = gpu_monitor.query_compute_processes(&gpu.pci_address) {
-                                            let total_compute: u64 = procs.iter().map(|p| p.used_mb).sum();
-                                            const DISPLAY_SAFETY_HEADROOM_MB: u64 = 512;
-                                            let display_vram = gpu.memory_used_mb.saturating_sub(total_compute);
-                                            let effective_reserve = (display_vram + DISPLAY_SAFETY_HEADROOM_MB).max(config.gpu.display_vram_reserve_mb);
-                                            st.scheduler.update_display_reserve(target, effective_reserve);
-                                        }
-                                    }
-                                }
-                            }
-
-                            // SM Clock Variance + Power Instability detection
-                            if let Some(egpu) = gpus.iter().find(|g| g.pci_address == config.gpu.egpu_pci_address) {
-                                let clock = egpu.clock_graphics_mhz as f64;
-                                // Update clock baseline (exponential moving average)
-                                clock_baseline = Some(match clock_baseline {
-                                    Some(baseline) => baseline * 0.95 + clock * 0.05,
-                                    None => clock,
-                                });
-                                // Check for SM clock variance: current clock < 80% of baseline while utilization > 50%
-                                if let Some(baseline) = clock_baseline {
-                                    if clock < baseline * 0.8 && egpu.utilization_gpu_percent > 50 {
-                                        warn!(
-                                            "SM-Clock-Varianz: {} MHz < 80% von Baseline {:.0} MHz bei {}% Auslastung",
-                                            egpu.clock_graphics_mhz, baseline, egpu.utilization_gpu_percent
-                                        );
-                                        let mut st = state.lock().await;
-                                        st.health_score.record_event(HealthEventKind::SmClockVariance);
+                                    // Scheduler-Metriken pro GPU
+                                    for (label, target) in [
+                                        ("egpu", crate::scheduler::GpuTarget::Egpu),
+                                        ("internal", crate::scheduler::GpuTarget::Internal),
+                                    ] {
+                                        let vram_used = st.scheduler.vram_used(target) as i64;
+                                        let vram_available = st.scheduler.vram_available(target) as i64;
+                                        m.update_scheduler(label, 0, vram_used, vram_available);
                                     }
                                 }
 
-                                // Power instability: track 10s window variance
-                                let power = egpu.power_draw_w;
-                                if power_history.len() >= 10 {
-                                    power_history.pop_front();
-                                }
-                                power_history.push_back(power);
-                                if power_history.len() >= 3 {
-                                    let mean = power_history.iter().sum::<f64>() / power_history.len() as f64;
-                                    let variance = power_history.iter()
-                                        .map(|p| (p - mean).powi(2))
-                                        .sum::<f64>() / power_history.len() as f64;
-                                    let stddev = variance.sqrt();
-                                    // If stddev > 30% of mean and mean > 50W (i.e. not idle), flag instability
-                                    if mean > 50.0 && stddev > mean * 0.3 {
-                                        warn!(
-                                            "Power-Instabilitaet: Stddev {:.1}W bei Mean {:.1}W (>30%)",
-                                            stddev, mean
-                                        );
-                                        let mut st = state.lock().await;
-                                        st.health_score.record_event(HealthEventKind::PowerInstability);
-                                    }
-                                }
+                                // Health score tick
+                                let health_trigger = st.health_score.tick();
+                                let health_summary = st.health_score.summary();
+
+                                // Telemetry data (collect under lock, log after drop)
+                                let telemetry_data = if last_telemetry_log.elapsed() >= std::time::Duration::from_secs(30) {
+                                    Some((st.health_score.current_score(), format!("{}", st.warning_machine.current_level())))
+                                } else {
+                                    None
+                                };
+
+                                let lock_hold_us = lock_start.elapsed().as_micros();
+                                debug!("GPU-Poller lock_hold_duration_us={lock_hold_us}");
+
+                                (health_summary, health_trigger, telemetry_data)
+                            };
+                            // Lock dropped here
+
+                            // Fleet: GPU-Verfügbarkeit aktualisieren (außerhalb des Locks)
+                            if let Some(ref mut fleet) = ollama_fleet {
+                                fleet.set_gpu_available(
+                                    crate::scheduler::GpuTarget::Egpu,
+                                    egpu_visible,
+                                );
                             }
 
-                            // Power budget check
-                            if config.gpu.max_combined_power_w > 0.0 {
-                                let combined_power: f64 = gpus.iter().map(|g| g.power_draw_w).sum();
-                                if combined_power > config.gpu.max_combined_power_w * 0.9 {
-                                    warn!(
-                                        "Kombinierte GPU-Last {:.0}W > 90% von {:.0}W Budget",
-                                        combined_power, config.gpu.max_combined_power_w
-                                    );
-                                }
+                            // Send pending triggers (after lock drop)
+                            for trigger in pending_triggers {
+                                let _ = trigger_tx.send(trigger).await;
                             }
 
-                            // Telemetry logging (every 30s to avoid DB bloat)
-                            if last_telemetry_log.elapsed() >= std::time::Duration::from_secs(30) {
-                                let st = state.lock().await;
-                                let hs = st.health_score.current_score();
-                                let wl = format!("{}", st.warning_machine.current_level());
-                                drop(st);
+                            // Send health score trigger if needed
+                            if let Some(trigger) = health_trigger {
+                                let _ = trigger_tx.send(trigger).await;
+                            }
 
+                            // SSE broadcasts (after lock drop)
+                            if let Some(ref sse) = sse {
+                                sse.send(BroadcastEvent::HealthScore(health_score_summary));
+
+                                let gpu_summary: Vec<serde_json::Value> = gpus
+                                    .iter()
+                                    .map(|g| {
+                                        serde_json::json!({
+                                            "pci_address": g.pci_address,
+                                            "name": g.name,
+                                            "temperature_c": g.temperature_c,
+                                            "utilization_gpu_percent": g.utilization_gpu_percent,
+                                            "memory_used_mb": g.memory_used_mb,
+                                            "memory_total_mb": g.memory_total_mb,
+                                        })
+                                    })
+                                    .collect();
+                                sse.send(BroadcastEvent::GpuStatus(
+                                    serde_json::json!({ "gpus": gpu_summary }),
+                                ));
+                            }
+
+                            // Telemetry logging (after lock drop, M1)
+                            if let Some((hs, wl)) = telemetry_data {
                                 for gpu in &gpus {
                                     let gpu_type = if gpu.pci_address == config.gpu.egpu_pci_address {
                                         "egpu"
@@ -913,42 +1033,6 @@ impl MonitorOrchestrator {
                                     }
                                 }
                                 last_telemetry_log = std::time::Instant::now();
-                            }
-
-                            // Health score tick + SSE broadcast
-                            {
-                                let mut st = state.lock().await;
-                                if let Some(trigger) = st.health_score.tick() {
-                                    drop(st);
-                                    let _ = trigger_tx.send(trigger).await;
-                                } else {
-                                    // Broadcast health score via SSE
-                                    if let Some(ref sse) = sse {
-                                        sse.send(BroadcastEvent::HealthScore(
-                                            st.health_score.summary(),
-                                        ));
-                                    }
-                                }
-                            }
-
-                            // Broadcast GPU status SSE event
-                            if let Some(ref sse) = sse {
-                                let gpu_summary: Vec<serde_json::Value> = gpus
-                                    .iter()
-                                    .map(|g| {
-                                        serde_json::json!({
-                                            "pci_address": g.pci_address,
-                                            "name": g.name,
-                                            "temperature_c": g.temperature_c,
-                                            "utilization_gpu_percent": g.utilization_gpu_percent,
-                                            "memory_used_mb": g.memory_used_mb,
-                                            "memory_total_mb": g.memory_total_mb,
-                                        })
-                                    })
-                                    .collect();
-                                sse.send(BroadcastEvent::GpuStatus(
-                                    serde_json::json!({ "gpus": gpu_summary }),
-                                ));
                             }
                         }
                         Err(e) => {
@@ -1006,10 +1090,60 @@ impl MonitorOrchestrator {
                         }
                     }
 
-                    // Query Ollama models if configured
-                    if let Some(ref ollama_cfg) = config.ollama
+                    // Query Ollama models — Fleet-Modus hat Vorrang
+                    if let Some(ref fleet) = ollama_fleet {
+                        let all_models = fleet.query_all_models().await;
+                        let mut combined_models = Vec::new();
+
+                        {
+                            let mut st = state.lock().await;
+                            st.ollama_models_by_instance = all_models.clone();
+
+                            // Modelle im Scheduler registrieren
+                            // Zuerst alle alten Model-Assignments entfernen
+                            let old_keys: Vec<_> = st.scheduler.loaded_models().keys().cloned().collect();
+                            for key in old_keys {
+                                st.scheduler.unregister_model(&key.0, &key.1);
+                            }
+
+                            for (inst_name, models) in &all_models {
+                                for model in models {
+                                    combined_models.push(model.clone());
+                                    // GPU-Target aus der Fleet-Instanz ableiten
+                                    if let Some(inst) = fleet.instance_by_name(inst_name) {
+                                        let vram_mb = model.size_vram_bytes / 1024 / 1024;
+                                        st.scheduler.register_model(
+                                            crate::scheduler::ModelAssignment {
+                                                model_name: model.name.clone(),
+                                                instance_name: inst_name.clone(),
+                                                target: inst.gpu_target,
+                                                vram_mb,
+                                                priority: inst.config.priority,
+                                                last_used: std::time::Instant::now(),
+                                                workload_type: inst.config.workload_types
+                                                    .first()
+                                                    .cloned()
+                                                    .unwrap_or_default(),
+                                            },
+                                        );
+                                    }
+                                }
+
+                                // Per-Instance Idle-Tracking
+                                let has_models = all_models.get(inst_name).map(|m| !m.is_empty()).unwrap_or(false);
+                                if has_models {
+                                    fleet_idle_trackers
+                                        .entry(inst_name.clone())
+                                        .or_insert_with(|| Some(std::time::Instant::now()));
+                                }
+                            }
+
+                            st.ollama_models = combined_models;
+                        }
+                    } else if let Some(ref ollama_cfg) = config.ollama
                         && ollama_cfg.enabled
                     {
+                        // Legacy: Einzelinstanz-Polling
                         match crate::nvidia::query_ollama_models(&ollama_cfg.host).await {
                             Ok(models) => {
                                 let has_models = !models.is_empty();
@@ -1123,7 +1257,17 @@ impl MonitorOrchestrator {
         }
 
         // Step 2: Unload Ollama models if configured
-        if let Some(ref ollama_cfg) = config.ollama {
+        // Fleet-Modus: Alle eGPU-Instanzen entladen
+        let instances = config.resolve_ollama_instances();
+        if !instances.is_empty() {
+            for inst in &instances {
+                if inst.gpu_device == config.gpu.egpu_pci_address {
+                    let ctl = crate::ollama::HttpOllamaControl::new(&inst.host);
+                    info!("Druckreduktion: Entlade Modelle auf '{}'", inst.name);
+                    Self::unload_all_ollama_models(&ctl, &state).await;
+                }
+            }
+        } else if let Some(ref ollama_cfg) = config.ollama {
             if ollama_cfg.enabled {
                 let ctl = crate::ollama::HttpOllamaControl::new(&ollama_cfg.host);
                 Self::unload_all_ollama_models(&ctl, &state).await;
@@ -1197,33 +1341,44 @@ impl MonitorOrchestrator {
                     // Heartbeat timeout: 2x the expected interval (60s default)
                     const HEARTBEAT_TIMEOUT_SECS: i64 = 60;
                     let now = Utc::now();
-                    let mut st = state.lock().await;
-                    let stale_leases: Vec<String> = st
-                        .active_leases
-                        .iter()
-                        .filter(|(_, lease)| {
-                            let heartbeat_stale = (now - lease.last_heartbeat).num_seconds() > HEARTBEAT_TIMEOUT_SECS;
-                            let expired = lease.expires_at <= now;
-                            heartbeat_stale || expired
-                        })
-                        .map(|(id, _)| id.clone())
-                        .collect();
 
-                    for id in stale_leases {
-                        if let Some(lease) = st.active_leases.remove(&id) {
-                            if lease.target_kind != LeaseTargetKind::Remote {
-                                st.scheduler.release_lease(&id);
+                    // M4: Collect stale lease info under lock, log after drop
+                    let expired_info: Vec<(String, &'static str, String, u64)> = {
+                        let mut st = state.lock().await;
+                        let stale_leases: Vec<String> = st
+                            .active_leases
+                            .iter()
+                            .filter(|(_, lease)| {
+                                let heartbeat_stale = (now - lease.last_heartbeat).num_seconds() > HEARTBEAT_TIMEOUT_SECS;
+                                let expired = lease.expires_at <= now;
+                                heartbeat_stale || expired
+                            })
+                            .map(|(id, _)| id.clone())
+                            .collect();
+
+                        let mut info_vec = Vec::new();
+                        for id in stale_leases {
+                            if let Some(lease) = st.active_leases.remove(&id) {
+                                if lease.target_kind != LeaseTargetKind::Remote {
+                                    st.scheduler.release_lease(&id);
+                                }
+                                let reason = if lease.expires_at <= now {
+                                    "abgelaufen"
+                                } else {
+                                    "Heartbeat-Timeout"
+                                };
+                                info_vec.push((id, reason, lease.pipeline, lease.vram_mb));
                             }
-                            let reason = if lease.expires_at <= now {
-                                "abgelaufen"
-                            } else {
-                                "Heartbeat-Timeout"
-                            };
-                            info!(
-                                "Lease {} {} (Pipeline: {}, VRAM: {} MB)",
-                                id, reason, lease.pipeline, lease.vram_mb
-                            );
                         }
+                        info_vec
+                    };
+                    // Lock dropped here — log outside
+
+                    for (id, reason, pipeline, vram_mb) in &expired_info {
+                        info!(
+                            "Lease {} {} (Pipeline: {}, VRAM: {} MB)",
+                            id, reason, pipeline, vram_mb
+                        );
                     }
                 }
             }
@@ -1364,10 +1519,19 @@ impl MonitorOrchestrator {
                             .and_then(|s| s.send_to(b"WATCHDOG=1", &socket_path));
                     }
 
-                    let mut state = state.lock().await;
-                    if let Some(new_level) = state.warning_machine.try_step_down() {
-                        state.scheduler.set_warning_level(new_level);
+                    // M1: Collect data under lock, drop before async I/O
+                    let step_down_result = {
+                        let mut state = state.lock().await;
+                        if let Some(new_level) = state.warning_machine.try_step_down() {
+                            state.scheduler.set_warning_level(new_level);
+                            Some(new_level)
+                        } else {
+                            None
+                        }
+                    };
+                    // Lock dropped here
 
+                    if let Some(new_level) = step_down_result {
                         let severity = match new_level {
                             WarningLevel::Green => Severity::Info,
                             WarningLevel::Yellow => Severity::Warning,

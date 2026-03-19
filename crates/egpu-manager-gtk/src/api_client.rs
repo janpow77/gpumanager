@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::state::{ConnectionState, PipelineInfo, StatusResponse, WidgetState};
 

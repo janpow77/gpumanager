@@ -6,16 +6,22 @@ mod kmsg;
 mod link_health;
 mod llm;
 mod monitor;
+#[allow(dead_code)] // NVML-Validierung vorbereitet, nicht integriert
 mod nvidia;
+#[allow(dead_code)] // OllamaManager/Fleet-Extras vorbereitet
 mod ollama;
+#[allow(dead_code)] // Recovery-Hilfsfunktionen vorbereitet
 mod recovery;
 mod remote_listener;
+#[allow(dead_code)] // Multi-GPU Scheduling vorbereitet
 mod scheduler;
+#[allow(dead_code)] // ZipArchive-Import fuer Verify-Funktion
 mod setup_generator;
 mod sysinfo;
 mod web;
 mod sysfs;
 mod metrics;
+#[allow(dead_code)] // WarningStateMachine-Erweiterungen vorbereitet
 mod warning;
 
 use std::path::PathBuf;
@@ -27,7 +33,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::db::EventDb;
-use crate::docker::DockerComposeControl;
 use crate::monitor::MonitorOrchestrator;
 use crate::recovery::RecoveryStateMachine;
 
@@ -275,6 +280,39 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Fleet-Info anzeigen (auch im Status-Modus)
+    {
+        let instances = config.resolve_ollama_instances();
+        if !instances.is_empty() {
+            info!("{} Ollama-Instanz(en) konfiguriert (Fleet-Modus)", instances.len());
+            for inst in &instances {
+                info!(
+                    "  Fleet '{}': {} → GPU {}, Modelle: {:?}, Workloads: {:?}",
+                    inst.name, inst.host, inst.gpu_device, inst.models, inst.workload_types
+                );
+            }
+        }
+        if let Some(ref gw) = config.llm_gateway {
+            if gw.enabled {
+                info!(
+                    "LLM Gateway aktiv: {} Provider, {} App-Routings",
+                    gw.providers.len(),
+                    gw.app_routing.len()
+                );
+                for routing in &gw.app_routing {
+                    let models: Vec<String> = routing.workload_model_map
+                        .iter()
+                        .map(|(k, v)| format!("{k}→{v}"))
+                        .collect();
+                    info!(
+                        "  App '{}': Provider={}, Modelle: [{}]",
+                        routing.app_id, routing.preferred_provider, models.join(", ")
+                    );
+                }
+            }
+        }
+    }
+
     if cli.status {
         info!("Status-Modus — Daemon wird nicht gestartet");
         return Ok(());
@@ -390,7 +428,59 @@ async fn main() -> anyhow::Result<()> {
 
     // Create Prometheus metrics
     let (daemon_metrics, metrics_state) = metrics::create_metrics();
+    let web_daemon_metrics = std::sync::Arc::clone(&daemon_metrics);
     orchestrator.set_metrics(daemon_metrics);
+
+    // OllamaFleet erstellen (Multi-Instanz-Modus)
+    let ollama_fleet = {
+        let instances = config.resolve_ollama_instances();
+        if instances.is_empty() {
+            None
+        } else {
+            info!("{} Ollama-Instanz(en) konfiguriert", instances.len());
+            for inst in &instances {
+                info!(
+                    "  Ollama '{}': {} (GPU {}, Modelle: {:?}, Workloads: {:?})",
+                    inst.name, inst.host, inst.gpu_device, inst.models, inst.workload_types
+                );
+            }
+            Some(std::sync::Arc::new(ollama::OllamaFleet::new(
+                instances,
+                &config.gpu.egpu_pci_address,
+            )))
+        }
+    };
+
+    // Lease-Recovery: Nicht-abgelaufene Leases aus SQLite wiederherstellen
+    {
+        let egpu_pci = config.gpu.egpu_pci_address.clone();
+        match db.load_active_leases().await {
+            Ok(leases) if !leases.is_empty() => {
+                let state_arc = orchestrator.state();
+                let mut st = state_arc.lock().await;
+                for persisted in &leases {
+                    let gpu_target = if persisted.gpu_device == egpu_pci {
+                        scheduler::GpuTarget::Egpu
+                    } else {
+                        scheduler::GpuTarget::Internal
+                    };
+                    st.scheduler.reserve_lease(
+                        persisted.lease_id.clone(),
+                        gpu_target,
+                        persisted.vram_mb,
+                    );
+                }
+                info!(
+                    "Lease-Recovery: {} aktive Leases aus vorherigem Daemon-Lauf wiederhergestellt",
+                    leases.len()
+                );
+            }
+            Ok(_) => {} // Keine Leases zu recovern
+            Err(e) => warn!("Lease-Recovery fehlgeschlagen: {e}"),
+        }
+        // Abgelaufene aufräumen
+        db.clean_expired_leases().await.ok();
+    }
 
     info!("Monitoring-Orchestrator wird gestartet");
 
@@ -400,9 +490,10 @@ async fn main() -> anyhow::Result<()> {
     let web_cancel = cancel.clone();
     let monitor_state = orchestrator.state();
     let web_metrics_state = metrics_state;
+    let web_fleet = ollama_fleet.clone();
 
     let web_handle = tokio::spawn(async move {
-        web::start_web_server(web_config, web_db, monitor_state.clone(), web_cancel.clone(), sse, Some(web_metrics_state)).await;
+        web::start_web_server(web_config, web_db, monitor_state.clone(), web_cancel.clone(), sse, Some(web_metrics_state), web_fleet, Some(web_daemon_metrics)).await;
     });
 
     // Start remote listener (separate server on port 7843) in parallel
